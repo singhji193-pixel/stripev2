@@ -8,6 +8,7 @@ app_license = "MIT"
 # Add "Request Payment (Stripe)" button on Sales Invoice
 doctype_js = {
     "Sales Invoice": "public/js/sales_invoice_stripe.js",
+    "Subscription": "public/js/subscription_stripe.js",
 }
 
 
