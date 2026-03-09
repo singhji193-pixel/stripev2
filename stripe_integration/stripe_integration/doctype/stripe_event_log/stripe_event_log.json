@@ -1,0 +1,104 @@
+{
+  "actions": [],
+  "allow_rename": 0,
+  "autoname": "hash",
+  "doctype": "DocType",
+  "engine": "InnoDB",
+  "field_order": [
+    "event_id",
+    "event_type",
+    "company",
+    "company_abbr",
+    "stripe_object_id",
+    "request_id",
+    "status",
+    "error",
+    "processed_at",
+    "payload_hash"
+  ],
+  "fields": [
+    {
+      "fieldname": "event_id",
+      "fieldtype": "Data",
+      "in_list_view": 1,
+      "label": "Event ID",
+      "reqd": 1,
+      "unique": 1
+    },
+    {
+      "fieldname": "event_type",
+      "fieldtype": "Data",
+      "in_list_view": 1,
+      "label": "Event Type"
+    },
+    {
+      "fieldname": "company",
+      "fieldtype": "Link",
+      "in_list_view": 1,
+      "label": "Company",
+      "options": "Company"
+    },
+    {
+      "fieldname": "company_abbr",
+      "fieldtype": "Data",
+      "label": "Company Abbr"
+    },
+    {
+      "fieldname": "stripe_object_id",
+      "fieldtype": "Data",
+      "label": "Stripe Object ID"
+    },
+    {
+      "fieldname": "request_id",
+      "fieldtype": "Link",
+      "label": "Integration Request",
+      "options": "Integration Request"
+    },
+    {
+      "default": "Queued",
+      "fieldname": "status",
+      "fieldtype": "Select",
+      "in_list_view": 1,
+      "label": "Status",
+      "options": "Queued\nProcessing\nCompleted\nFailed\nIgnored"
+    },
+    {
+      "fieldname": "error",
+      "fieldtype": "Small Text",
+      "label": "Error"
+    },
+    {
+      "fieldname": "processed_at",
+      "fieldtype": "Datetime",
+      "label": "Processed At"
+    },
+    {
+      "fieldname": "payload_hash",
+      "fieldtype": "Data",
+      "label": "Payload SHA256"
+    }
+  ],
+  "is_submittable": 0,
+  "issingle": 0,
+  "istable": 0,
+  "module": "Stripe Integration",
+  "name": "Stripe Event Log",
+  "owner": "Administrator",
+  "permissions": [
+    {
+      "create": 1,
+      "delete": 0,
+      "email": 1,
+      "export": 1,
+      "print": 1,
+      "read": 1,
+      "report": 1,
+      "role": "System Manager",
+      "share": 1,
+      "write": 1
+    }
+  ],
+  "sort_field": "modified",
+  "sort_order": "DESC",
+  "track_changes": 1
+}

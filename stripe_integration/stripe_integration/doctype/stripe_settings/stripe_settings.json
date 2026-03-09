@@ -1,0 +1,36 @@
+{
+  "actions": [],
+  "allow_rename": 0,
+  "autoname": "hash",
+  "doctype": "DocType",
+  "document_type": "Setup",
+  "engine": "InnoDB",
+  "fields": [
+    {
+      "default": 0,
+      "fieldname": "enabled",
+      "fieldtype": "Check",
+      "label": "Enabled"
+    }
+  ],
+  "issingle": 1,
+  "module": "Stripe Integration",
+  "name": "Stripe Settings",
+  "owner": "Administrator",
+  "permissions": [
+    {
+      "create": 0,
+      "delete": 0,
+      "email": 1,
+      "export": 1,
+      "print": 1,
+      "read": 1,
+      "report": 1,
+      "role": "System Manager",
+      "share": 1,
+      "write": 1
+    }
+  ],
+  "sort_field": "modified",
+  "sort_order": "DESC"
+}

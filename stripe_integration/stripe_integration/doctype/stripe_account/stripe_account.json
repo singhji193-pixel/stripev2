@@ -1,0 +1,83 @@
+{
+  "actions": [],
+  "allow_rename": 0,
+  "autoname": "field:company_abbr",
+  "doctype": "DocType",
+  "engine": "InnoDB",
+  "field_order": [
+    "enabled",
+    "test_mode",
+    "company",
+    "company_abbr",
+    "publishable_key",
+    "secret_key",
+    "webhook_secret"
+  ],
+  "fields": [
+    {
+      "default": 1,
+      "fieldname": "enabled",
+      "fieldtype": "Check",
+      "label": "Enabled"
+    },
+    {
+      "default": 1,
+      "fieldname": "test_mode",
+      "fieldtype": "Check",
+      "label": "Test Mode"
+    },
+    {
+      "fieldname": "company",
+      "fieldtype": "Link",
+      "label": "Company",
+      "options": "Company"
+    },
+    {
+      "fieldname": "company_abbr",
+      "fieldtype": "Data",
+      "label": "Company Abbr",
+      "reqd": 1,
+      "unique": 1
+    },
+    {
+      "fieldname": "publishable_key",
+      "fieldtype": "Data",
+      "label": "Publishable Key",
+      "reqd": 1
+    },
+    {
+      "fieldname": "secret_key",
+      "fieldtype": "Password",
+      "label": "Secret Key",
+      "reqd": 1
+    },
+    {
+      "fieldname": "webhook_secret",
+      "fieldtype": "Password",
+      "label": "Webhook Secret"
+    }
+  ],
+  "is_submittable": 0,
+  "issingle": 0,
+  "istable": 0,
+  "module": "Stripe Integration",
+  "name": "Stripe Account",
+  "owner": "Administrator",
+  "permissions": [
+    {
+      "create": 1,
+      "delete": 1,
+      "email": 1,
+      "export": 1,
+      "print": 1,
+      "read": 1,
+      "report": 1,
+      "role": "System Manager",
+      "share": 1,
+      "write": 1
+    }
+  ],
+  "sort_field": "modified",
+  "sort_order": "DESC",
+  "track_changes": 1
+}
