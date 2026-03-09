@@ -1,5 +1,4 @@
 import json
-
 import frappe
 import stripe
 
@@ -41,7 +40,6 @@ def _event_stub(subscription_doc, action: str):
 
 
 def _validate_transition(stripe_sub_id: str, action: str):
-    # Safety checks to avoid unnecessary API mutations
     if action not in {"pause", "resume"}:
         return True, None
 
@@ -87,7 +85,6 @@ def _sync_subscription(subscription_doc, action: str):
         elif action == "pause":
             stripe.Subscription.modify(stripe_sub_id, pause_collection={"behavior": "void"})
         elif action == "plan_change":
-            # reserved for next batch when ERP plan->Stripe price mapping is finalized
             mark_event_status(ev["id"], "Ignored", "plan_change_not_implemented")
             return {"handled": False, "reason": "plan_change_not_implemented", "subscription": subscription_doc.name}
 
@@ -102,6 +99,81 @@ def _sync_subscription(subscription_doc, action: str):
     except Exception as e:
         mark_event_status(ev["id"], "Failed", str(e))
         raise
+
+
+def _erp_status_options():
+    try:
+        opts = frappe.db.get_value("DocField", {"parent": "Subscription", "fieldname": "status"}, "options") or ""
+        return {x.strip() for x in opts.split("\\n") if x.strip()}
+    except Exception:
+        return set()
+
+
+def _map_stripe_to_erp_status(stripe_status: str | None, paused: bool = False):
+    s = (stripe_status or "").strip().lower()
+    if s in {"canceled", "incomplete_expired"}:
+        return "Cancelled"
+    if s in {"past_due"}:
+        return "Past Due Date"
+    if s in {"unpaid", "incomplete"}:
+        return "Unpaid"
+    if s in {"active", "trialing"}:
+        return "Active"
+    return None
+
+
+def _apply_subscription_state(sub_name: str, stripe_sub_obj: dict):
+    stripe_status = (stripe_sub_obj or {}).get("status")
+    paused = bool((stripe_sub_obj or {}).get("pause_collection"))
+    cancel_at_period_end = int(bool((stripe_sub_obj or {}).get("cancel_at_period_end")))
+
+    update = {}
+    if frappe.get_meta("Subscription").get_field("stripe_status"):
+        update["stripe_status"] = stripe_status or ""
+    if frappe.get_meta("Subscription").get_field("cancel_at_period_end"):
+        update["cancel_at_period_end"] = cancel_at_period_end
+
+    erp_status = _map_stripe_to_erp_status(stripe_status, paused=paused)
+    allowed = _erp_status_options()
+    if erp_status and (not allowed or erp_status in allowed):
+        update["status"] = erp_status
+
+    if update:
+        frappe.db.set_value("Subscription", sub_name, update, update_modified=False)
+        frappe.db.commit()
+
+    return {
+        "subscription": sub_name,
+        "stripe_status": stripe_status,
+        "paused": paused,
+        "erp_status": update.get("status"),
+    }
+
+
+@frappe.whitelist()
+def sync_subscription_from_webhook_event(event: dict):
+    stripe_sub = (event or {}).get("data", {}).get("object", {}) or {}
+    stripe_sub_id = stripe_sub.get("id")
+    if not stripe_sub_id:
+        return {"handled": False, "reason": "missing_stripe_subscription_id"}
+
+    sub_name = frappe.db.get_value("Subscription", {"stripe_subscription_id": stripe_sub_id}, "name")
+    if not sub_name:
+        return {"handled": False, "reason": "subscription_not_found", "stripe_subscription_id": stripe_sub_id}
+
+    return _apply_subscription_state(sub_name, stripe_sub)
+
+
+@frappe.whitelist()
+def reconcile_subscription_status(subscription_name: str):
+    sub = frappe.get_doc("Subscription", subscription_name)
+    stripe_sub_id = getattr(sub, "stripe_subscription_id", None)
+    if not stripe_sub_id:
+        return {"handled": False, "reason": "missing_stripe_subscription_id", "subscription": subscription_name}
+
+    _set_api_key_for_company(sub.company)
+    remote = stripe.Subscription.retrieve(stripe_sub_id)
+    return _apply_subscription_state(sub.name, dict(remote))
 
 
 @frappe.whitelist()
@@ -146,7 +218,6 @@ def on_subscription_update(doc, method=None):
     if not _is_enabled():
         return
 
-    # Guardrail: no Stripe ID means nothing to sync
     if not getattr(doc, "stripe_subscription_id", None):
         return
 
@@ -155,11 +226,9 @@ def on_subscription_update(doc, method=None):
         queue_subscription_action(doc.name, "cancel")
         return
 
-    # optional explicit action hook via custom field (if present)
     action = _normalize_action(getattr(doc, "stripe_sync_action", None))
     if action in ("pause", "resume", "plan_change"):
         queue_subscription_action(doc.name, action)
-        # clear one-shot action field to prevent accidental re-queue loops
         try:
             frappe.db.set_value("Subscription", doc.name, "stripe_sync_action", "", update_modified=False)
         except Exception:
