@@ -1,5 +1,6 @@
 frappe.ui.form.on("Subscription", {
   refresh(frm) {
+    removeLegacyButtons(frm);
     const stripeSubId = frm.doc.stripe_subscription_id;
     if (!stripeSubId) return;
 
@@ -15,6 +16,17 @@ frappe.ui.form.on("Subscription", {
     frm.add_custom_button(__("Stripe: View Sync Log"), () => showSyncLog(frm));
   }
 });
+
+
+function removeLegacyButtons(frm) {
+  [
+    __("Fetch Subscription Updates"),
+    __("Force-Fetch Subscription Updates"),
+    __("Cancel Subscription")
+  ].forEach((label) => {
+    try { frm.remove_custom_button(label); } catch (e) {}
+  });
+}
 
 function runStripeAction(frm, action) {
   frappe.call({
