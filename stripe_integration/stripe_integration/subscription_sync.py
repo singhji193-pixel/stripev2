@@ -130,6 +130,8 @@ def _apply_subscription_state(sub_name: str, stripe_sub_obj: dict):
     update = {}
     if frappe.get_meta("Subscription").get_field("stripe_status"):
         update["stripe_status"] = stripe_status or ""
+    if frappe.get_meta("Subscription").get_field("stripe_paused"):
+        update["stripe_paused"] = 1 if paused else 0
     if frappe.get_meta("Subscription").get_field("cancel_at_period_end"):
         update["cancel_at_period_end"] = cancel_at_period_end
 
