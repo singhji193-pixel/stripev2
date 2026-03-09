@@ -104,7 +104,7 @@ def _sync_subscription(subscription_doc, action: str):
 def _erp_status_options():
     try:
         opts = frappe.db.get_value("DocField", {"parent": "Subscription", "fieldname": "status"}, "options") or ""
-        return {x.strip() for x in opts.split("\\n") if x.strip()}
+        return {x.strip() for x in opts.split("\n") if x.strip()}
     except Exception:
         return set()
 
