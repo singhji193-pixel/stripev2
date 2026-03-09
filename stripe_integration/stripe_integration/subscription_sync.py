@@ -216,6 +216,74 @@ def get_recent_subscription_sync_events(subscription_name: str, limit: int = 20)
     )
 
 
+
+@frappe.whitelist()
+def retry_failed_subscription_events(limit: int = 20):
+    rows = frappe.get_all(
+        "Stripe Event Log",
+        filters={"status": "Failed"},
+        fields=["name", "event_id", "event_type", "stripe_object_id", "error", "modified"],
+        order_by="modified desc",
+        limit_page_length=max(1, min(int(limit or 20), 100)),
+    )
+
+    out = []
+    for r in rows:
+        et = (r.get("event_type") or "").strip().lower()
+        if not et.startswith("subscription."):
+            continue
+
+        action = et.split(".", 1)[1] if "." in et else None
+        action = _normalize_action(action)
+        if not action or action == "plan_change":
+            continue
+
+        sub_name = frappe.db.get_value("Subscription", {"stripe_subscription_id": r.get("stripe_object_id")}, "name")
+        if not sub_name:
+            out.append({"event_id": r.get("event_id"), "retried": False, "reason": "subscription_not_found"})
+            continue
+
+        try:
+            result = sync_subscription_action(sub_name, action)
+            out.append({"event_id": r.get("event_id"), "subscription": sub_name, "action": action, "result": result})
+        except Exception as e:
+            out.append({"event_id": r.get("event_id"), "subscription": sub_name, "action": action, "error": str(e)[:300]})
+
+    return out
+
+
+@frappe.whitelist()
+def get_subscription_sync_health(hours: int = 24):
+    hours = max(1, min(int(hours or 24), 168))
+    failed = frappe.db.sql(
+        """
+        select count(*) from `tabStripe Event Log`
+        where status='Failed' and modified >= (NOW() - INTERVAL %s HOUR)
+        """,
+        (hours,),
+    )[0][0]
+    completed = frappe.db.sql(
+        """
+        select count(*) from `tabStripe Event Log`
+        where status='Completed' and modified >= (NOW() - INTERVAL %s HOUR)
+        """,
+        (hours,),
+    )[0][0]
+    ignored = frappe.db.sql(
+        """
+        select count(*) from `tabStripe Event Log`
+        where status='Ignored' and modified >= (NOW() - INTERVAL %s HOUR)
+        """,
+        (hours,),
+    )[0][0]
+
+    return {
+        "window_hours": hours,
+        "completed": int(completed),
+        "failed": int(failed),
+        "ignored": int(ignored),
+    }
+
 def on_subscription_update(doc, method=None):
     if not _is_enabled():
         return
