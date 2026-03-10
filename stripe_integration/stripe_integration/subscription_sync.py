@@ -179,6 +179,21 @@ def _resolve_sender(company_abbr: str):
     }
 
 
+def _build_subscription_invoice_attachment(sub_doc):
+    try:
+        si_name = frappe.db.get_value(
+            "Sales Invoice",
+            {"subscription": sub_doc.name, "docstatus": 1},
+            "name",
+            order_by="posting_date desc, posting_time desc, modified desc",
+        )
+        if not si_name:
+            return None
+        return frappe.attach_print("Sales Invoice", si_name, file_name=f"{si_name}.pdf")
+    except Exception:
+        return None
+
+
 def _send_lifecycle_email(subscription_name: str, company_abbr: str, kind: str, stripe_sub_obj: dict):
     template_name = (LIFECYCLE_TEMPLATE_MAP.get(company_abbr or "", {}) or {}).get(kind)
     if not template_name:
@@ -212,6 +227,7 @@ def _send_lifecycle_email(subscription_name: str, company_abbr: str, kind: str, 
         "company": sub_doc.get("company") or "",
         "stripe_subscription_id": sub_doc.get("stripe_subscription_id") or (stripe_sub_obj or {}).get("id") or "",
         "stripe_status": (stripe_sub_obj or {}).get("status") or "",
+        "stripe_checkout_url": sub_doc.get("stripe_checkout_url") or "",
         "paused": 1 if bool((stripe_sub_obj or {}).get("pause_collection")) else 0,
     }
 
@@ -220,12 +236,18 @@ def _send_lifecycle_email(subscription_name: str, company_abbr: str, kind: str, 
     message = frappe.render_template(et.response or "", args)
 
     sender_cfg = _resolve_sender(company_abbr)
+    attachments = []
+    if kind == "add_payment_method":
+        inv_pdf = _build_subscription_invoice_attachment(sub_doc)
+        if inv_pdf:
+            attachments.append(inv_pdf)
 
     frappe.sendmail(
         recipients=[to_email],
         subject=subject,
         message=message,
         sender=sender_cfg["sender"],
+        attachments=attachments or None,
         now=True,
         delayed=False,
         add_unsubscribe_link=0,
