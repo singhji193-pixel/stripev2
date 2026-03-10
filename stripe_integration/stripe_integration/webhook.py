@@ -7,6 +7,7 @@ from stripe_integration.stripe_integration.utils import get_webhook_secret, get_
 from stripe_integration.stripe_integration.event_log import upsert_event, mark_event_status
 from stripe_integration.stripe_integration.subscription_payments import handle_invoice_paid
 from stripe_integration.stripe_integration.subscription_sync import sync_subscription_from_webhook_event
+from stripe_integration.stripe_integration.payout_sync import sync_payout_from_webhook_event
 
 
 def _integration_request_is_completed(event_id: str) -> bool:
@@ -130,6 +131,8 @@ def handle_webhook():
             handle_invoice_paid(event)
         elif event_type.startswith("customer.subscription.") and event_type not in ("customer.subscription.created", "customer.subscription.trial_will_end"):
             sync_subscription_from_webhook_event(event)
+        elif event_type.startswith("payout."):
+            sync_payout_from_webhook_event(event)
 
         if event_id and not _integration_request_is_completed(event_id):
             _log_integration_request(
