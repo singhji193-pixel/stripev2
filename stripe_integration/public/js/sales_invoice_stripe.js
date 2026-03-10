@@ -1,6 +1,45 @@
 frappe.ui.form.on("Sales Invoice", {
   refresh(frm) {
     if (frm.doc.docstatus !== 1) return;
+
+    const hasActiveStripeLink = !!(frm.doc.stripe_checkout_session_id || frm.doc.stripe_checkout_url);
+
+    if (hasActiveStripeLink) {
+      frm.add_custom_button("Void Stripe Link", () => {
+        frappe.confirm(
+          "This will void the current Stripe checkout link/session. Continue?",
+          () => {
+            frappe.call({
+              method: "stripe_integration.stripe_integration.api.void_payment_link_stripe",
+              args: { invoice_name: frm.doc.name },
+              freeze: true,
+              freeze_message: "Voiding Stripe payment link...",
+              callback: (r) => {
+                const res = r.message || {};
+                if (!res.ok) {
+                  frappe.msgprint({
+                    title: "Stripe",
+                    message: "Failed to void Stripe link/session. Check Error Log.",
+                    indicator: "red"
+                  });
+                  return;
+                }
+                frappe.show_alert({ message: "Stripe link/session voided", indicator: "green" });
+                frm.reload_doc();
+              },
+              error: () => {
+                frappe.msgprint({
+                  title: "Stripe",
+                  message: "Error calling server method. Check Error Log.",
+                  indicator: "red"
+                });
+              }
+            });
+          }
+        );
+      }, "Payments");
+    }
+
     if ((frm.doc.outstanding_amount || 0) <= 0) return;
     if (frm.doc.status === "Paid") return;
 
