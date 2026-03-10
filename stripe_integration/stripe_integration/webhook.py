@@ -3,7 +3,7 @@ import frappe
 import stripe
 
 from frappe.exceptions import DuplicateEntryError
-from stripe_integration.stripe_integration.utils import get_webhook_secret, get_company_abbr_from_company
+from stripe_integration.stripe_integration.utils import get_webhook_secret, get_company_abbr_from_company, get_api_key
 from stripe_integration.stripe_integration.event_log import upsert_event, mark_event_status
 from stripe_integration.stripe_integration.subscription_payments import handle_invoice_paid
 from stripe_integration.stripe_integration.subscription_sync import sync_subscription_from_webhook_event
@@ -164,6 +164,10 @@ def _handle_checkout_session(session: dict):
     docname = metadata.get("docname")
     request_kind = metadata.get("request_kind")
 
+    if doctype == "Subscription" and docname:
+        _handle_subscription_setup_session(session)
+        return
+
     if doctype != "Sales Invoice" or not docname:
         return
 
@@ -174,6 +178,52 @@ def _handle_checkout_session(session: dict):
         return
 
     _create_payment_entry_for_sales_invoice(docname, pi_id, paid_amount, request_kind=request_kind)
+
+
+def _handle_subscription_setup_session(session: dict):
+    metadata = session.get("metadata") or {}
+    sub_name = metadata.get("docname")
+    if not sub_name or not frappe.db.exists("Subscription", sub_name):
+        return
+
+    company_abbr = metadata.get("company_abbr") or get_company_abbr_from_company(
+        frappe.db.get_value("Subscription", sub_name, "company")
+    )
+    if not company_abbr:
+        return
+
+    stripe.api_key = get_api_key(company_abbr)
+
+    setup_intent_id = session.get("setup_intent")
+    stripe_sub_id = metadata.get("stripe_subscription_id") or frappe.db.get_value("Subscription", sub_name, "stripe_subscription_id")
+
+    if not setup_intent_id:
+        return
+
+    si = stripe.SetupIntent.retrieve(setup_intent_id)
+    payment_method = getattr(si, "payment_method", None)
+    stripe_customer_id = session.get("customer") or getattr(si, "customer", None)
+
+    if not payment_method:
+        return
+
+    # Ensure payment method is reusable for off-session subscription charges
+    if stripe_customer_id:
+        try:
+            stripe.PaymentMethod.attach(payment_method, customer=stripe_customer_id)
+        except Exception:
+            pass
+
+        try:
+            stripe.Customer.modify(stripe_customer_id, invoice_settings={"default_payment_method": payment_method})
+        except Exception:
+            pass
+
+    if stripe_sub_id:
+        try:
+            stripe.Subscription.modify(stripe_sub_id, default_payment_method=payment_method)
+        except Exception:
+            pass
 
 
 def _create_payment_entry_for_sales_invoice(sales_invoice_name: str, stripe_pi_id: str, paid_amount: float, request_kind: str | None = None):

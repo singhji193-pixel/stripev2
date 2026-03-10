@@ -2,6 +2,7 @@ import json
 import frappe
 import stripe
 
+from frappe.utils import get_url
 from stripe_integration.stripe_integration.utils import get_company_abbr_from_company, get_api_key
 from stripe_integration.stripe_integration.event_log import upsert_event, mark_event_status
 
@@ -179,6 +180,55 @@ def _resolve_sender(company_abbr: str):
     }
 
 
+def _generate_subscription_setup_checkout_url(sub_doc, company_abbr: str, to_email: str | None = None):
+    # Create a fresh setup-mode Checkout Session so customer adds a payment method
+    # without immediate charge. This avoids stale/expired one-time payment links.
+    stripe_sub_id = sub_doc.get("stripe_subscription_id")
+    if not stripe_sub_id:
+        return sub_doc.get("stripe_checkout_url") or ""
+
+    _set_api_key_for_company(sub_doc.get("company"))
+
+    stripe_customer_id = None
+    try:
+        remote_sub = stripe.Subscription.retrieve(stripe_sub_id)
+        stripe_customer_id = getattr(remote_sub, "customer", None)
+    except Exception:
+        stripe_customer_id = None
+
+    success_url = get_url() + "/api/method/stripe_integration.stripe_integration.api.payment_success?subscription=" + sub_doc.name
+    cancel_url = get_url() + "/api/method/stripe_integration.stripe_integration.api.payment_cancelled?subscription=" + sub_doc.name
+
+    params = {
+        "mode": "setup",
+        "success_url": success_url,
+        "cancel_url": cancel_url,
+        "metadata": {
+            "doctype": "Subscription",
+            "docname": sub_doc.name,
+            "company": sub_doc.get("company") or "",
+            "company_abbr": company_abbr,
+            "source": "subscription_add_payment_method",
+            "stripe_subscription_id": stripe_sub_id,
+            "site": frappe.local.site,
+        },
+    }
+
+    if stripe_customer_id:
+        params["customer"] = stripe_customer_id
+    elif to_email:
+        params["customer_email"] = to_email
+
+    session = stripe.checkout.Session.create(**params)
+    checkout_url = session.get("url")
+
+    if checkout_url and frappe.get_meta("Subscription").get_field("stripe_checkout_url"):
+        frappe.db.set_value("Subscription", sub_doc.name, "stripe_checkout_url", checkout_url, update_modified=False)
+        frappe.db.commit()
+
+    return checkout_url or (sub_doc.get("stripe_checkout_url") or "")
+
+
 def _build_subscription_invoice_attachment(sub_doc):
     try:
         si_name = frappe.db.get_value(
@@ -231,6 +281,13 @@ def _send_lifecycle_email(subscription_name: str, company_abbr: str, kind: str, 
     except Exception:
         plan_name = ""
 
+    checkout_url = sub_doc.get("stripe_checkout_url") or ""
+    if kind == "add_payment_method":
+        try:
+            checkout_url = _generate_subscription_setup_checkout_url(sub_doc, company_abbr, to_email=to_email)
+        except Exception:
+            checkout_url = sub_doc.get("stripe_checkout_url") or ""
+
     args = {
         "subscription_name": sub_doc.name,
         "party": sub_doc.get("party") or "",
@@ -239,7 +296,7 @@ def _send_lifecycle_email(subscription_name: str, company_abbr: str, kind: str, 
         "company": sub_doc.get("company") or "",
         "stripe_subscription_id": sub_doc.get("stripe_subscription_id") or (stripe_sub_obj or {}).get("id") or "",
         "stripe_status": (stripe_sub_obj or {}).get("status") or "",
-        "stripe_checkout_url": sub_doc.get("stripe_checkout_url") or "",
+        "stripe_checkout_url": checkout_url,
         "paused": 1 if bool((stripe_sub_obj or {}).get("pause_collection")) else 0,
     }
 
