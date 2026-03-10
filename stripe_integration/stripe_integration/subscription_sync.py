@@ -201,6 +201,7 @@ def _generate_subscription_setup_checkout_url(sub_doc, company_abbr: str, to_ema
 
     params = {
         "mode": "setup",
+        "payment_method_types": ["card"],
         "success_url": success_url,
         "cancel_url": cancel_url,
         "metadata": {
@@ -283,10 +284,9 @@ def _send_lifecycle_email(subscription_name: str, company_abbr: str, kind: str, 
 
     checkout_url = sub_doc.get("stripe_checkout_url") or ""
     if kind == "add_payment_method":
-        try:
-            checkout_url = _generate_subscription_setup_checkout_url(sub_doc, company_abbr, to_email=to_email)
-        except Exception:
-            checkout_url = sub_doc.get("stripe_checkout_url") or ""
+        checkout_url = _generate_subscription_setup_checkout_url(sub_doc, company_abbr, to_email=to_email)
+        if not checkout_url:
+            return {"sent": False, "reason": "setup_checkout_url_missing", "template": template_name}
 
     args = {
         "subscription_name": sub_doc.name,
