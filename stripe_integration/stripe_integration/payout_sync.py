@@ -57,7 +57,9 @@ def _make_journal_entry(company: str, payout_id: str, gross: float, fee: float, 
     je = frappe.new_doc("Journal Entry")
     je.voucher_type = "Journal Entry"
     je.company = company
+    je.posting_date = frappe.utils.nowdate()
     je.cheque_no = payout_id
+    je.cheque_date = frappe.utils.nowdate()
     je.user_remark = f"Stripe payout {payout_id} (gross={gross}, fee={fee}, net={net})"
 
     je.append("accounts", {"account": accounts["bank"], "debit_in_account_currency": net})
@@ -99,7 +101,15 @@ def sync_payout_from_webhook_event(event: dict):
 
     stripe.api_key = get_api_key(company_abbr)
 
-    gross_c, fee_c, net_c = _sum_balance_txns_for_payout(payout_id)
+    try:
+        gross_c, fee_c, net_c = _sum_balance_txns_for_payout(payout_id)
+    except Exception:
+        # Stripe blocks payout-filtered balance transaction listing for some manual payouts.
+        # Fallback to payout object amounts to keep posting reliable.
+        payout = stripe.Payout.retrieve(payout_id)
+        gross_c = int(payout.get("amount") or 0)
+        fee_c = int(payout.get("fee") or 0)
+        net_c = int(payout.get("amount") or 0) - int(payout.get("fee") or 0)
 
     gross = gross_c / 100.0
     fee = abs(fee_c) / 100.0
