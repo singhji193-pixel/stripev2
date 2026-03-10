@@ -192,9 +192,23 @@ def _send_lifecycle_email(subscription_name: str, company_abbr: str, kind: str, 
     if not to_email:
         return {"sent": False, "reason": "recipient_email_missing", "template": template_name}
 
+    customer_name = sub_doc.get("party") or ""
+    if (sub_doc.get("party_type") or "") == "Customer" and sub_doc.get("party"):
+        customer_name = frappe.db.get_value("Customer", sub_doc.get("party"), "customer_name") or customer_name
+
+    plan_name = ""
+    try:
+        plans = sub_doc.get("plans") or []
+        if plans and getattr(plans[0], "plan", None):
+            plan_name = plans[0].plan
+    except Exception:
+        plan_name = ""
+
     args = {
         "subscription_name": sub_doc.name,
         "party": sub_doc.get("party") or "",
+        "customer_name": customer_name,
+        "plan_name": plan_name,
         "company": sub_doc.get("company") or "",
         "stripe_subscription_id": sub_doc.get("stripe_subscription_id") or (stripe_sub_obj or {}).get("id") or "",
         "stripe_status": (stripe_sub_obj or {}).get("status") or "",
