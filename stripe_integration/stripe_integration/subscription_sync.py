@@ -24,6 +24,14 @@ LIFECYCLE_TEMPLATE_MAP = {
 ALLOWED_COMPANY_ABBR = {"COE", "COSL"}
 VALID_ACTIONS = {"pause", "resume", "cancel", "plan_change"}
 
+SETUP_URL_FIELD = "stripe_setup_checkout_url"
+SETUP_SESSION_FIELD = "stripe_setup_session_id"
+SETUP_CREATED_AT_FIELD = "stripe_setup_link_created_at"
+SETUP_EXPIRES_AT_FIELD = "stripe_setup_link_expires_at"
+SETUP_STATUS_FIELD = "stripe_setup_link_status"
+SETUP_PM_FIELD = "stripe_default_payment_method_id"
+SETUP_INTENT_FIELD = "stripe_last_setup_intent_id"
+
 
 def _is_enabled() -> bool:
     try:
@@ -180,13 +188,20 @@ def _resolve_sender(company_abbr: str):
     }
 
 
+def _set_subscription_fields(sub_name: str, values: dict):
+    meta = frappe.get_meta("Subscription")
+    update = {k: v for k, v in (values or {}).items() if meta.get_field(k)}
+    if update:
+        frappe.db.set_value("Subscription", sub_name, update, update_modified=False)
+        frappe.db.commit()
+
+
 def _generate_subscription_setup_checkout_url(sub_doc, company_abbr: str, to_email: str | None = None):
     # Create a fresh setup-mode Checkout Session so customer adds a payment method
     # without immediate charge. This avoids stale/expired one-time payment links.
     stripe_sub_id = sub_doc.get("stripe_subscription_id")
     if not stripe_sub_id:
-        return sub_doc.get("stripe_checkout_url") or ""
-
+        return ""
     _set_api_key_for_company(sub_doc.get("company"))
 
     stripe_customer_id = None
@@ -199,8 +214,11 @@ def _generate_subscription_setup_checkout_url(sub_doc, company_abbr: str, to_ema
     success_url = get_url() + "/api/method/stripe_integration.stripe_integration.api.payment_success?subscription=" + sub_doc.name
     cancel_url = get_url() + "/api/method/stripe_integration.stripe_integration.api.payment_cancelled?subscription=" + sub_doc.name
 
+    currency = (frappe.get_cached_value("Company", sub_doc.get("company"), "default_currency") or "CAD").lower()
+
     params = {
         "mode": "setup",
+        "currency": currency,
         "payment_method_types": ["card"],
         "success_url": success_url,
         "cancel_url": cancel_url,
@@ -223,11 +241,21 @@ def _generate_subscription_setup_checkout_url(sub_doc, company_abbr: str, to_ema
     session = stripe.checkout.Session.create(**params)
     checkout_url = session.get("url")
 
-    if checkout_url and frappe.get_meta("Subscription").get_field("stripe_checkout_url"):
-        frappe.db.set_value("Subscription", sub_doc.name, "stripe_checkout_url", checkout_url, update_modified=False)
-        frappe.db.commit()
+    if checkout_url:
+        _set_subscription_fields(
+            sub_doc.name,
+            {
+                SETUP_URL_FIELD: checkout_url,
+                SETUP_SESSION_FIELD: session.get("id") or "",
+                SETUP_CREATED_AT_FIELD: frappe.utils.now_datetime(),
+                SETUP_EXPIRES_AT_FIELD: frappe.utils.get_datetime(session.get("expires_at")) if session.get("expires_at") else None,
+                SETUP_STATUS_FIELD: "pending",
+                # keep legacy field in sync for backward-compatible templates
+                "stripe_checkout_url": checkout_url,
+            },
+        )
 
-    return checkout_url or (sub_doc.get("stripe_checkout_url") or "")
+    return checkout_url or ""
 
 
 def _build_subscription_invoice_attachment(sub_doc):
@@ -282,7 +310,7 @@ def _send_lifecycle_email(subscription_name: str, company_abbr: str, kind: str, 
     except Exception:
         plan_name = ""
 
-    checkout_url = sub_doc.get("stripe_checkout_url") or ""
+    checkout_url = sub_doc.get(SETUP_URL_FIELD) or sub_doc.get("stripe_checkout_url") or ""
     if kind == "add_payment_method":
         checkout_url = _generate_subscription_setup_checkout_url(sub_doc, company_abbr, to_email=to_email)
         if not checkout_url:
