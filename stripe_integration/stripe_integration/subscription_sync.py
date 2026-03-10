@@ -189,7 +189,15 @@ def _build_subscription_invoice_attachment(sub_doc):
         )
         if not si_name:
             return None
-        return frappe.attach_print("Sales Invoice", si_name, file_name=f"{si_name}.pdf")
+
+        # Match Request Payment (Stripe) attachment behavior/print pipeline
+        return {
+            "print_format_attachment": 1,
+            "doctype": "Sales Invoice",
+            "name": si_name,
+            "print_letterhead": 1,
+            "lang": "en",
+        }
     except Exception:
         return None
 
