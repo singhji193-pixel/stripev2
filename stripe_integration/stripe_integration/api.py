@@ -187,6 +187,62 @@ def _send_payment_email(
 
 
 @frappe.whitelist()
+def void_payment_link_stripe(invoice_name: str):
+    """Void an active Stripe checkout link for a submitted Sales Invoice.
+
+    - Checkout Session: expire session
+    - Payment Link fallback: deactivate payment link
+    """
+
+    doctype = "Sales Invoice"
+    _require_doc_permission(doctype, invoice_name, "write")
+
+    inv = frappe.get_doc(doctype, invoice_name)
+    if inv.docstatus != 1:
+        frappe.throw("Invoice must be Submitted before voiding payment link")
+
+    session_or_link_id = inv.get("stripe_checkout_session_id")
+    checkout_url = inv.get("stripe_checkout_url")
+
+    if not session_or_link_id and not checkout_url:
+        frappe.throw("No Stripe payment link/session found on this invoice")
+
+    company = inv.get("company")
+    company_abbr = get_company_abbr_from_company(company)
+    if not company_abbr:
+        frappe.throw("Could not determine company abbr from invoice")
+
+    stripe.api_key = get_api_key(company_abbr)
+
+    result = {"ok": True, "invoice": invoice_name, "id": session_or_link_id}
+
+    try:
+        if session_or_link_id and str(session_or_link_id).startswith("cs_"):
+            stripe.checkout.Session.expire(session_or_link_id)
+            result["voided_type"] = "checkout_session"
+        elif session_or_link_id and str(session_or_link_id).startswith("plink_"):
+            stripe.PaymentLink.modify(session_or_link_id, active=False)
+            result["voided_type"] = "payment_link"
+        else:
+            # Unknown id type: best effort by URL parse for payment links
+            if checkout_url and "/pay/" in checkout_url:
+                # If we only have URL and unknown id, keep clear error to avoid false success
+                frappe.throw("Stored Stripe id is not voidable automatically; please verify session/link id")
+            frappe.throw("Unsupported Stripe session/link id format")
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "Stripe void payment link/session failed")
+        raise
+
+    _safe_set_value(doctype, invoice_name, "stripe_checkout_url", None)
+    _safe_set_value(doctype, invoice_name, "stripe_checkout_session_id", None)
+    _safe_set_value(doctype, invoice_name, "stripe_last_payment_link_sent", None)
+    _safe_append_history(inv, f"{now()} | voided | {result.get('voided_type')} | {session_or_link_id}")
+    frappe.db.commit()
+
+    return result
+
+
+@frappe.whitelist()
 def request_payment_stripe(invoice_name: str):
     """Default: Stripe Checkout Session (hosted). Fallback: Stripe Payment Link.
 
