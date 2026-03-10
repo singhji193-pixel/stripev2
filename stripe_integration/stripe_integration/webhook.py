@@ -6,7 +6,13 @@ from frappe.exceptions import DuplicateEntryError
 from stripe_integration.stripe_integration.utils import get_webhook_secret, get_company_abbr_from_company, get_api_key
 from stripe_integration.stripe_integration.event_log import upsert_event, mark_event_status
 from stripe_integration.stripe_integration.subscription_payments import handle_invoice_paid
-from stripe_integration.stripe_integration.subscription_sync import sync_subscription_from_webhook_event
+from stripe_integration.stripe_integration.subscription_sync import (
+    sync_subscription_from_webhook_event,
+    _set_subscription_fields,
+    SETUP_STATUS_FIELD,
+    SETUP_PM_FIELD,
+    SETUP_INTENT_FIELD,
+)
 from stripe_integration.stripe_integration.payout_sync import sync_payout_from_webhook_event
 
 
@@ -224,6 +230,15 @@ def _handle_subscription_setup_session(session: dict):
             stripe.Subscription.modify(stripe_sub_id, default_payment_method=payment_method)
         except Exception:
             pass
+
+    _set_subscription_fields(
+        sub_name,
+        {
+            SETUP_STATUS_FIELD: "completed",
+            SETUP_PM_FIELD: payment_method,
+            SETUP_INTENT_FIELD: setup_intent_id,
+        },
+    )
 
 
 def _create_payment_entry_for_sales_invoice(sales_invoice_name: str, stripe_pi_id: str, paid_amount: float, request_kind: str | None = None):
