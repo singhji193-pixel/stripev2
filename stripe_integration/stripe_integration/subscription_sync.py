@@ -167,6 +167,18 @@ def _pick_lifecycle_kind(prev_status: str | None, prev_paused: bool, new_status:
     return None
 
 
+def _resolve_sender(company_abbr: str):
+    if company_abbr == "COSL":
+        return {
+            "sender": "CoreOrbit <next@coengine.ai>",
+            "email_account": "CoreOrbit SMTP",
+        }
+    return {
+        "sender": "COEngine <erp@coengine.ai>",
+        "email_account": "COEngine SMTP",
+    }
+
+
 def _send_lifecycle_email(subscription_name: str, company_abbr: str, kind: str, stripe_sub_obj: dict):
     template_name = (LIFECYCLE_TEMPLATE_MAP.get(company_abbr or "", {}) or {}).get(kind)
     if not template_name:
@@ -193,10 +205,14 @@ def _send_lifecycle_email(subscription_name: str, company_abbr: str, kind: str, 
     subject = frappe.render_template(et.subject or "Subscription Update", args)
     message = frappe.render_template(et.response or "", args)
 
+    sender_cfg = _resolve_sender(company_abbr)
+
     frappe.sendmail(
         recipients=[to_email],
         subject=subject,
         message=message,
+        sender=sender_cfg["sender"],
+        email_account=sender_cfg["email_account"],
         now=True,
         delayed=False,
         add_unsubscribe_link=0,
