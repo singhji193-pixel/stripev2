@@ -158,13 +158,17 @@ def _send_payment_email(
     }
 
     # Attach invoice PDF using site's default print format for Sales Invoice
-    attachments = [{
+    attachment = {
         "print_format_attachment": 1,
         "doctype": "Sales Invoice",
         "name": invoice_name,
         "print_letterhead": 1,
         "lang": "en",
-    }]
+    }
+    if (company_abbr or "").upper() == "COSL":
+        attachment["print_format"] = "CoreOrbit Beautiful Invoice"
+
+    attachments = [attachment]
 
     template_name = "Stripe CoreOrbit Payment Request" if (company_abbr or "").upper() == "COSL" else "Stripe COEngine Payment Request"
     et = frappe.get_doc("Email Template", template_name)

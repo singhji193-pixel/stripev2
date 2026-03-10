@@ -191,13 +191,17 @@ def _build_subscription_invoice_attachment(sub_doc):
             return None
 
         # Match Request Payment (Stripe) attachment behavior/print pipeline
-        return {
+        attachment = {
             "print_format_attachment": 1,
             "doctype": "Sales Invoice",
             "name": si_name,
             "print_letterhead": 1,
             "lang": "en",
         }
+        company_abbr = get_company_abbr_from_company(sub_doc.get("company"))
+        if company_abbr == "COSL":
+            attachment["print_format"] = "CoreOrbit Beautiful Invoice"
+        return attachment
     except Exception:
         return None
 
