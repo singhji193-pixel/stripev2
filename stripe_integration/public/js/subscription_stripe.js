@@ -1,8 +1,6 @@
 frappe.ui.form.on("Subscription", {
   refresh(frm) {
     removeLegacyButtons(frm);
-    const stripeSubId = frm.doc.stripe_subscription_id;
-    if (!stripeSubId) return;
 
     frm.add_custom_button(__("Stripe: Pause"), () => runStripeAction(frm, "pause"));
     frm.add_custom_button(__("Stripe: Resume"), () => runStripeAction(frm, "resume"));
@@ -29,6 +27,15 @@ function removeLegacyButtons(frm) {
 }
 
 function runStripeAction(frm, action) {
+  if (!frm.doc.stripe_subscription_id) {
+    frappe.msgprint({
+      title: __("Missing Stripe Subscription ID"),
+      indicator: "orange",
+      message: __("This subscription is not linked to Stripe yet. Set stripe_subscription_id first, then retry.")
+    });
+    return;
+  }
+
   frappe.call({
     method: "stripe_integration.stripe_integration.subscription_sync.sync_subscription_action",
     args: {
@@ -54,6 +61,15 @@ function runStripeAction(frm, action) {
 }
 
 function showSyncLog(frm) {
+  if (!frm.doc.stripe_subscription_id) {
+    frappe.msgprint({
+      title: __("Missing Stripe Subscription ID"),
+      indicator: "orange",
+      message: __("No Stripe sync log is available until this subscription is linked to Stripe.")
+    });
+    return;
+  }
+
   frappe.call({
     method: "stripe_integration.stripe_integration.subscription_sync.get_recent_subscription_sync_events",
     args: {
