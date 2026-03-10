@@ -5,6 +5,21 @@ import stripe
 from stripe_integration.stripe_integration.utils import get_company_abbr_from_company, get_api_key
 from stripe_integration.stripe_integration.event_log import upsert_event, mark_event_status
 
+LIFECYCLE_TEMPLATE_MAP = {
+    "COE": {
+        "add_payment_method": "Stripe COEngine Add Payment Method",
+        "started": "Stripe COEngine Subscription Started",
+        "paused": "Stripe COEngine Subscription Paused",
+        "cancelled": "Stripe COEngine Subscription Cancelled",
+    },
+    "COSL": {
+        "add_payment_method": "Stripe CoreOrbit Add Payment Method",
+        "started": "Stripe CoreOrbit Subscription Started",
+        "paused": "Stripe CoreOrbit Subscription Paused",
+        "cancelled": "Stripe CoreOrbit Subscription Cancelled",
+    },
+}
+
 ALLOWED_COMPANY_ABBR = {"COE", "COSL"}
 VALID_ACTIONS = {"pause", "resume", "cancel", "plan_change"}
 
@@ -122,10 +137,83 @@ def _map_stripe_to_erp_status(stripe_status: str | None, paused: bool = False):
     return None
 
 
+def _resolve_subscription_email(sub_doc):
+    for fn in ("contact_email", "email", "subscriber_email", "customer_email"):
+        v = sub_doc.get(fn)
+        if v:
+            return v
+
+    party_type = (sub_doc.get("party_type") or "").strip()
+    party = sub_doc.get("party")
+    if party_type == "Customer" and party:
+        email = frappe.db.get_value("Customer", party, "email_id")
+        if email:
+            return email
+    return None
+
+
+def _pick_lifecycle_kind(prev_status: str | None, prev_paused: bool, new_status: str | None, new_paused: bool):
+    ps = (prev_status or "").strip().lower()
+    ns = (new_status or "").strip().lower()
+
+    if ns in {"canceled", "incomplete_expired"} and ns != ps:
+        return "cancelled"
+    if new_paused and not prev_paused:
+        return "paused"
+    if ns in {"unpaid", "incomplete", "past_due"} and ns != ps:
+        return "add_payment_method"
+    if ns in {"active", "trialing"} and not new_paused and (ps not in {"active", "trialing"} or prev_paused):
+        return "started"
+    return None
+
+
+def _send_lifecycle_email(subscription_name: str, company_abbr: str, kind: str, stripe_sub_obj: dict):
+    template_name = (LIFECYCLE_TEMPLATE_MAP.get(company_abbr or "", {}) or {}).get(kind)
+    if not template_name:
+        return {"sent": False, "reason": "template_not_mapped"}
+
+    if not frappe.db.exists("Email Template", template_name):
+        return {"sent": False, "reason": "template_missing", "template": template_name}
+
+    sub_doc = frappe.get_doc("Subscription", subscription_name)
+    to_email = _resolve_subscription_email(sub_doc)
+    if not to_email:
+        return {"sent": False, "reason": "recipient_email_missing", "template": template_name}
+
+    args = {
+        "subscription_name": sub_doc.name,
+        "party": sub_doc.get("party") or "",
+        "company": sub_doc.get("company") or "",
+        "stripe_subscription_id": sub_doc.get("stripe_subscription_id") or (stripe_sub_obj or {}).get("id") or "",
+        "stripe_status": (stripe_sub_obj or {}).get("status") or "",
+        "paused": 1 if bool((stripe_sub_obj or {}).get("pause_collection")) else 0,
+    }
+
+    et = frappe.get_doc("Email Template", template_name)
+    subject = frappe.render_template(et.subject or "Subscription Update", args)
+    message = frappe.render_template(et.response or "", args)
+
+    frappe.sendmail(
+        recipients=[to_email],
+        subject=subject,
+        message=message,
+        now=True,
+        delayed=False,
+        add_unsubscribe_link=0,
+        reference_doctype="Subscription",
+        reference_name=sub_doc.name,
+    )
+    return {"sent": True, "template": template_name, "to": to_email, "kind": kind}
+
+
 def _apply_subscription_state(sub_name: str, stripe_sub_obj: dict):
     stripe_status = (stripe_sub_obj or {}).get("status")
     paused = bool((stripe_sub_obj or {}).get("pause_collection"))
     cancel_at_period_end = int(bool((stripe_sub_obj or {}).get("cancel_at_period_end")))
+
+    prev = frappe.db.get_value("Subscription", sub_name, ["stripe_status", "stripe_paused"], as_dict=True) or {}
+    prev_status = prev.get("stripe_status")
+    prev_paused = bool(prev.get("stripe_paused"))
 
     update = {}
     if frappe.get_meta("Subscription").get_field("stripe_status"):
@@ -149,6 +237,8 @@ def _apply_subscription_state(sub_name: str, stripe_sub_obj: dict):
         "stripe_status": stripe_status,
         "paused": paused,
         "erp_status": update.get("status"),
+        "prev_stripe_status": prev_status,
+        "prev_paused": prev_paused,
     }
 
 
@@ -163,7 +253,26 @@ def sync_subscription_from_webhook_event(event: dict):
     if not sub_name:
         return {"handled": False, "reason": "subscription_not_found", "stripe_subscription_id": stripe_sub_id}
 
-    return _apply_subscription_state(sub_name, stripe_sub)
+    out = _apply_subscription_state(sub_name, stripe_sub)
+
+    company = frappe.db.get_value("Subscription", sub_name, "company")
+    company_abbr = get_company_abbr_from_company(company)
+    kind = _pick_lifecycle_kind(
+        out.get("prev_stripe_status"),
+        bool(out.get("prev_paused")),
+        out.get("stripe_status"),
+        bool(out.get("paused")),
+    )
+
+    if kind and company_abbr in ALLOWED_COMPANY_ABBR:
+        try:
+            email_out = _send_lifecycle_email(sub_name, company_abbr, kind, stripe_sub)
+            out["email"] = email_out
+            out["lifecycle_kind"] = kind
+        except Exception as e:
+            out["email"] = {"sent": False, "reason": str(e)[:300]}
+
+    return out
 
 
 @frappe.whitelist()
