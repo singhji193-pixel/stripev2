@@ -322,7 +322,15 @@ def _send_payment_receipt_email(invoice, pe, request_kind=None):
 
     grand_total = float(invoice.get("grand_total") or 0)
     payment_amount = float(pe.get("paid_amount") or pe.get("received_amount") or 0)
-    remaining_balance = float(invoice.get("outstanding_amount") or 0)
+
+    # Prefer ledger-derived remaining, but guard against stale invoice values at send time.
+    invoice_remaining = float(invoice.get("outstanding_amount") or 0)
+    computed_remaining = max(grand_total - payment_amount, 0.0)
+
+    if payment_amount >= (grand_total - 0.01):
+        remaining_balance = 0.0
+    else:
+        remaining_balance = max(min(invoice_remaining, computed_remaining), 0.0)
 
     payment_percentage = round((payment_amount / grand_total) * 100, 2) if grand_total > 0 else 100
     remaining_percentage = round((remaining_balance / grand_total) * 100, 2) if grand_total > 0 else 0
