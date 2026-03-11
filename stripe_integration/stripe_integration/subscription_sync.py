@@ -273,20 +273,9 @@ def _build_subscription_invoice_attachment(sub_doc):
         if not si_name:
             return None
 
-        # Match Request Payment (Stripe) attachment behavior/print pipeline
-        attachment = {
-            "print_format_attachment": 1,
-            "doctype": "Sales Invoice",
-            "name": si_name,
-            "print_letterhead": 1,
-            "lang": "en",
-        }
         company_abbr = get_company_abbr_from_company(sub_doc.get("company"))
-        if company_abbr == "COSL":
-            attachment["print_format"] = "CoreOrbit Beautiful Invoice"
-        elif company_abbr == "COE":
-            attachment["print_format"] = "COEngine Beautiful Invoice"
-        return attachment
+        pf = "CoreOrbit Beautiful Invoice" if company_abbr == "COSL" else "COEngine Beautiful Invoice"
+        return frappe.attach_print("Sales Invoice", si_name, file_name=f"{si_name}.pdf", print_format=pf)
     except Exception:
         return None
 
