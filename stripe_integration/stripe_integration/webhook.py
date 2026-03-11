@@ -309,6 +309,9 @@ def _get_customer_email_from_invoice(invoice):
 
 
 def _send_payment_receipt_email(invoice, pe, request_kind=None):
+    # Reload invoice after Payment Entry submit to avoid stale outstanding_amount
+    invoice = frappe.get_doc("Sales Invoice", invoice.name)
+
     company_abbr = get_company_abbr_from_company(invoice.get("company")) or ""
     is_cosl = (company_abbr.upper() == "COSL")
     brand_name = "CoreOrbit" if is_cosl else "COEngine"
