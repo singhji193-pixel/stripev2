@@ -363,6 +363,9 @@ def _send_payment_receipt_email(invoice, pe, request_kind=None):
     subject = frappe.render_template(et.subject or "Payment Receipt", args)
     message = frappe.render_template(et.response or "", args)
 
+    pf = "Payment Receipt - CoreOrbit" if is_cosl else "Payment Receipt - COEngine"
+    pe_pdf = frappe.attach_print("Payment Entry", pe.name, file_name=f"{pe.name}.pdf", print_format=pf)
+
     frappe.sendmail(
         recipients=[to_email],
         subject=subject,
@@ -374,11 +377,5 @@ def _send_payment_receipt_email(invoice, pe, request_kind=None):
         add_unsubscribe_link=0,
         reference_doctype="Payment Entry",
         reference_name=pe.name,
-        attachments=[{
-            "print_format_attachment": 1,
-            "doctype": "Payment Entry",
-            "name": pe.name,
-            "print_letterhead": 1,
-            "lang": "en",
-        }],
+        attachments=[pe_pdf] if pe_pdf else None,
     )
