@@ -38,4 +38,8 @@ fixtures = [
         "dt": "Custom Field",
         "filters": [["dt", "in", ["Subscription", "Sales Invoice", "Payment Entry"]]],
     },
+    {
+        "dt": "Print Format",
+        "filters": [["name", "in", ["CoreOrbit Beautiful Invoice", "COEngine Beautiful Invoice"]]],
+    },
 ]

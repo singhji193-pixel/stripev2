@@ -284,6 +284,8 @@ def _build_subscription_invoice_attachment(sub_doc):
         company_abbr = get_company_abbr_from_company(sub_doc.get("company"))
         if company_abbr == "COSL":
             attachment["print_format"] = "CoreOrbit Beautiful Invoice"
+        elif company_abbr == "COE":
+            attachment["print_format"] = "COEngine Beautiful Invoice"
         return attachment
     except Exception:
         return None

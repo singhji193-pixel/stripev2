@@ -175,8 +175,11 @@ def _send_payment_email(
         "print_letterhead": 1,
         "lang": "en",
     }
-    if (company_abbr or "").upper() == "COSL":
+    abbr = (company_abbr or "").upper()
+    if abbr == "COSL":
         attachment["print_format"] = "CoreOrbit Beautiful Invoice"
+    elif abbr == "COE":
+        attachment["print_format"] = "COEngine Beautiful Invoice"
 
     attachments = [attachment]
 
