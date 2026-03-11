@@ -140,9 +140,19 @@ def _send_payment_email(
     # Build dynamic args used by template/plain fallback
     payment_type = "partial" if request_kind in ("deposit", "remainder") else "full"
     is_initial_payment = 1 if request_kind == "deposit" else 0
-    payment_percentage = 60 if request_kind in ("deposit", "remainder") else 100
 
     inv = frappe.get_doc("Sales Invoice", invoice_name)
+    grand_total = float(inv.get("grand_total") or 0)
+    configured_initial_pct = float(inv.get("initial_payment_percentage") or 0)
+
+    if request_kind == "deposit":
+        payment_percentage = configured_initial_pct if 0 < configured_initial_pct <= 100 else (
+            round((float(amount) / grand_total) * 100, 2) if grand_total > 0 else 100
+        )
+    elif request_kind == "remainder":
+        payment_percentage = round((float(amount) / grand_total) * 100, 2) if grand_total > 0 else 100
+    else:
+        payment_percentage = 100
     customer_name = inv.get("customer_name") or inv.get("customer") or "Customer"
 
     args = {
