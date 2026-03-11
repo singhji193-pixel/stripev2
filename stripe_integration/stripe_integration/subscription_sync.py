@@ -10,12 +10,14 @@ LIFECYCLE_TEMPLATE_MAP = {
     "COE": {
         "add_payment_method": "Stripe COEngine Add Payment Method",
         "started": "Stripe COEngine Subscription Started",
+        "resumed": "Stripe COEngine Subscription Resumed",
         "paused": "Stripe COEngine Subscription Paused",
         "cancelled": "Stripe COEngine Subscription Cancelled",
     },
     "COSL": {
         "add_payment_method": "Stripe CoreOrbit Add Payment Method",
         "started": "Stripe CoreOrbit Subscription Started",
+        "resumed": "Stripe CoreOrbit Subscription Started",
         "paused": "Stripe CoreOrbit Subscription Paused",
         "cancelled": "Stripe CoreOrbit Subscription Cancelled",
     },
@@ -171,7 +173,9 @@ def _pick_lifecycle_kind(prev_status: str | None, prev_paused: bool, new_status:
         return "paused"
     if ns in {"unpaid", "incomplete", "past_due"} and ns != ps:
         return "add_payment_method"
-    if ns in {"active", "trialing"} and not new_paused and (ps not in {"active", "trialing"} or prev_paused):
+    if ns in {"active", "trialing"} and not new_paused and prev_paused:
+        return "resumed"
+    if ns in {"active", "trialing"} and not new_paused and ps not in {"active", "trialing"}:
         return "started"
     return None
 
