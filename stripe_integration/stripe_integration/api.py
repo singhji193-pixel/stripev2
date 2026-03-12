@@ -25,13 +25,20 @@ def _require_stripe_action_guard(gate_password: str = None):
         frappe.throw("Not permitted", frappe.PermissionError)
 
     # Optional password gate from Stripe Settings. If no password is configured, only role+doc perms apply.
-    settings = frappe.get_cached_doc("Stripe Settings", "Stripe Settings")
-    try:
-        configured = settings.get_password("stripe_action_password")
-    except Exception:
-        configured = None
+    # Use __Auth existence check to avoid noisy "Password not found..." server messages.
+    has_gate = bool(
+        frappe.db.get_value(
+            "__Auth",
+            {
+                "doctype": "Stripe Settings",
+                "name": "Stripe Settings",
+                "fieldname": "stripe_action_password",
+            },
+            "name",
+        )
+    )
 
-    if not configured:
+    if not has_gate:
         return
 
     if not gate_password:
