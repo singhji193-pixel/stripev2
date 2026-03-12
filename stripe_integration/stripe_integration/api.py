@@ -51,6 +51,31 @@ def _require_stripe_action_guard(gate_password: str = None):
         frappe.throw("Invalid approval password", frappe.PermissionError)
 
 
+def _enforce_refund_threshold_approval(refund_amount: float):
+    """Optional extra approval gate for high-value refunds.
+
+    Stripe Settings > Refund Approval Threshold Amount (currency amount):
+    - <= 0 or empty: disabled
+    - > 0: refunds at/above threshold require System Manager role
+
+    This is additive to the existing stripe_action_password gate.
+    """
+
+    threshold = flt(frappe.db.get_single_value("Stripe Settings", "refund_approval_threshold_amount") or 0)
+    if threshold <= 0:
+        return
+
+    if flt(refund_amount) < threshold:
+        return
+
+    user_roles = set(frappe.get_roles(frappe.session.user))
+    if "System Manager" not in user_roles:
+        frappe.throw(
+            f"Refunds of {fmt_money(threshold)} or more require System Manager approval",
+            frappe.PermissionError,
+        )
+
+
 def _get_recipient_email(doc):
     for fn in ["contact_email", "customer_email", "email_id"]:
         if getattr(doc, fn, None):
@@ -428,6 +453,8 @@ def refund_payment_stripe(invoice_name: str, gate_password: str = None, reason: 
 
     if amount_received <= 0:
         frappe.throw("Stripe payment has no received amount to refund")
+
+    _enforce_refund_threshold_approval(amount_received)
 
     refund = stripe.Refund.create(
         payment_intent=pi_id,
