@@ -17,6 +17,13 @@ REQUIRED_TEMPLATES = [
     "Stripe COEngine Refund Processed",
 ]
 
+REQUIRED_PRINT_FORMATS = [
+    "CoreOrbit Beautiful Invoice",
+    "COEngine Beautiful Invoice",
+    "CoreOrbit Refund Confirmation",
+    "COEngine Refund Confirmation",
+]
+
 REQUIRED_SUB_FIELDS = [
     "stripe_setup_checkout_url",
     "stripe_setup_session_id",
@@ -32,6 +39,7 @@ def run():
     out = {
         "ok": True,
         "missing_templates": [],
+        "missing_print_formats": [],
         "missing_subscription_fields": [],
         "notes": [],
     }
@@ -40,12 +48,16 @@ def run():
         if not frappe.db.exists("Email Template", name):
             out["missing_templates"].append(name)
 
+    for name in REQUIRED_PRINT_FORMATS:
+        if not frappe.db.exists("Print Format", name):
+            out["missing_print_formats"].append(name)
+
     meta = frappe.get_meta("Subscription")
     for fieldname in REQUIRED_SUB_FIELDS:
         if not meta.get_field(fieldname):
             out["missing_subscription_fields"].append(fieldname)
 
-    if out["missing_templates"] or out["missing_subscription_fields"]:
+    if out["missing_templates"] or out["missing_print_formats"] or out["missing_subscription_fields"]:
         out["ok"] = False
 
     # smoke: confirm COSL add-payment template uses setup URL first
