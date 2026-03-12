@@ -21,6 +21,31 @@ REFUND_RATE_LIMIT_WINDOW_SECONDS = 60
 REFUND_RATE_LIMIT_MAX_ATTEMPTS = 5
 
 
+def _log_refund_security_audit(invoice_name: str, check: str, outcome: str, **details):
+    """Write minimal security audit entries for refund guard decisions."""
+    logger_factory = getattr(frappe, "logger", None)
+    if not callable(logger_factory):
+        return
+
+    payload = {
+        "event": "stripe_refund_security_check",
+        "invoice": invoice_name,
+        "check": check,
+        "outcome": outcome,
+        "actor": (getattr(getattr(frappe, "session", None), "user", None) or "guest"),
+    }
+
+    safe_details = {k: v for k, v in details.items() if v is not None}
+    if safe_details:
+        payload["details"] = safe_details
+
+    try:
+        logger_factory("stripe_refund_security").info(payload)
+    except Exception:
+        # Never block refund flow if audit logging itself has issues.
+        pass
+
+
 def _cache_get():
     cache_fn = getattr(frappe, "cache", None)
     if callable(cache_fn):
@@ -68,10 +93,23 @@ def _require_doc_permission(doctype: str, name: str, ptype: str = "write"):
         frappe.throw("Not permitted", frappe.PermissionError)
 
 
-def _require_stripe_action_guard(gate_password: str = None):
+def _require_stripe_action_guard(gate_password: str = None, invoice_name: str = None):
     user_roles = set(frappe.get_roles(frappe.session.user))
     if not any(role in user_roles for role in STRIPE_ACTION_ROLES):
+        _log_refund_security_audit(
+            invoice_name,
+            check="role_guard",
+            outcome="blocked_missing_role",
+            roles=sorted(user_roles),
+        )
         frappe.throw("Not permitted", frappe.PermissionError)
+
+    _log_refund_security_audit(
+        invoice_name,
+        check="role_guard",
+        outcome="passed",
+        roles=sorted(user_roles),
+    )
 
     # Optional password gate from Stripe Settings. If no password is configured, only role+doc perms apply.
     # Use __Auth existence check to avoid noisy "Password not found..." server messages.
@@ -88,18 +126,23 @@ def _require_stripe_action_guard(gate_password: str = None):
     )
 
     if not has_gate:
+        _log_refund_security_audit(invoice_name, check="password_gate", outcome="skipped_not_configured")
         return
 
     if not gate_password:
+        _log_refund_security_audit(invoice_name, check="password_gate", outcome="blocked_missing_password")
         frappe.throw("Approval password is required", frappe.PermissionError)
 
     try:
         check_password("Stripe Settings", "Stripe Settings", gate_password, "stripe_action_password")
     except frappe.AuthenticationError:
+        _log_refund_security_audit(invoice_name, check="password_gate", outcome="blocked_invalid_password")
         frappe.throw("Invalid approval password", frappe.PermissionError)
 
+    _log_refund_security_audit(invoice_name, check="password_gate", outcome="passed")
 
-def _enforce_refund_threshold_approval(refund_amount: float):
+
+def _enforce_refund_threshold_approval(refund_amount: float, invoice_name: str = None):
     """Optional extra approval gate for high-value refunds.
 
     Stripe Settings > Refund Approval Threshold Amount (currency amount):
@@ -110,18 +153,45 @@ def _enforce_refund_threshold_approval(refund_amount: float):
     """
 
     threshold = flt(frappe.db.get_single_value("Stripe Settings", "refund_approval_threshold_amount") or 0)
+    amount = flt(refund_amount)
+
     if threshold <= 0:
+        _log_refund_security_audit(invoice_name, check="threshold_guard", outcome="disabled")
         return
 
-    if flt(refund_amount) < threshold:
+    if amount < threshold:
+        _log_refund_security_audit(
+            invoice_name,
+            check="threshold_guard",
+            outcome="below_threshold",
+            threshold=threshold,
+            refund_amount=amount,
+        )
         return
 
     user_roles = set(frappe.get_roles(frappe.session.user))
     if "System Manager" not in user_roles:
+        _log_refund_security_audit(
+            invoice_name,
+            check="threshold_guard",
+            outcome="blocked_non_system_manager",
+            threshold=threshold,
+            refund_amount=amount,
+            roles=sorted(user_roles),
+        )
         frappe.throw(
             f"Refunds of {fmt_money(threshold)} or more require System Manager approval",
             frappe.PermissionError,
         )
+
+    _log_refund_security_audit(
+        invoice_name,
+        check="threshold_guard",
+        outcome="passed",
+        threshold=threshold,
+        refund_amount=amount,
+        roles=sorted(user_roles),
+    )
 
 
 def _get_recipient_email(doc):
@@ -337,8 +407,10 @@ def _has_submitted_credit_note(invoice_name: str) -> bool:
 
 def _require_submitted_credit_note(invoice_name: str):
     if _has_submitted_credit_note(invoice_name):
+        _log_refund_security_audit(invoice_name, check="credit_note_guard", outcome="passed")
         return
 
+    _log_refund_security_audit(invoice_name, check="credit_note_guard", outcome="blocked_missing_credit_note")
     frappe.throw(
         f"{CREDIT_NOTE_REQUIRED_ERROR_CODE}: Submit a Credit Note linked to this invoice before running Stripe refund.",
         frappe.ValidationError,
@@ -397,7 +469,7 @@ def void_payment_link_stripe(invoice_name: str, gate_password: str = None):
 
     doctype = "Sales Invoice"
     _require_doc_permission(doctype, invoice_name, "write")
-    _require_stripe_action_guard(gate_password)
+    _require_stripe_action_guard(gate_password, invoice_name=invoice_name)
 
     inv = frappe.get_doc(doctype, invoice_name)
     if inv.docstatus != 1:
@@ -456,7 +528,7 @@ def refund_payment_stripe(invoice_name: str, gate_password: str = None, reason: 
 
     doctype = "Sales Invoice"
     _require_doc_permission(doctype, invoice_name, "write")
-    _require_stripe_action_guard(gate_password)
+    _require_stripe_action_guard(gate_password, invoice_name=invoice_name)
     _enforce_refund_rate_limit(invoice_name)
 
     inv = frappe.get_doc(doctype, invoice_name)
@@ -503,7 +575,7 @@ def refund_payment_stripe(invoice_name: str, gate_password: str = None, reason: 
     if amount_received <= 0:
         frappe.throw("Stripe payment has no received amount to refund")
 
-    _enforce_refund_threshold_approval(amount_received)
+    _enforce_refund_threshold_approval(amount_received, invoice_name=invoice_name)
 
     refund = stripe.Refund.create(
         payment_intent=pi_id,
@@ -555,7 +627,7 @@ def request_payment_stripe(invoice_name: str, gate_password: str = None):
 
     doctype = "Sales Invoice"
     _require_doc_permission(doctype, invoice_name, "write")
-    _require_stripe_action_guard(gate_password)
+    _require_stripe_action_guard(gate_password, invoice_name=invoice_name)
 
     inv = frappe.get_doc(doctype, invoice_name)
     if inv.docstatus != 1:
