@@ -228,6 +228,19 @@ def _send_payment_email(
     )
 
 
+def _build_refund_pdf_attachment(invoice_name: str, company_abbr: str):
+    abbr = (company_abbr or "").upper()
+    preferred = "CoreOrbit Refund Confirmation" if abbr == "COSL" else "COEngine Refund Confirmation"
+    fallback = "CoreOrbit Beautiful Invoice" if abbr == "COSL" else "COEngine Beautiful Invoice"
+
+    pf = preferred if frappe.db.exists("Print Format", preferred) else fallback
+    try:
+        return frappe.attach_print("Sales Invoice", invoice_name, file_name=f"{invoice_name}-refund.pdf", print_format=pf)
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "Refund PDF attachment generation failed")
+        return None
+
+
 def _send_refund_email(invoice_name: str, company_abbr: str, refund_payload: dict):
     to_email = _get_recipient_email(frappe.get_doc("Sales Invoice", invoice_name))
     if not to_email:
@@ -251,6 +264,7 @@ def _send_refund_email(invoice_name: str, company_abbr: str, refund_payload: dic
     et = frappe.get_doc("Email Template", template_name)
     subject = frappe.render_template(et.subject or "Refund processed", args)
     message = frappe.render_template(et.response or "", args)
+    refund_pdf = _build_refund_pdf_attachment(invoice_name, company_abbr)
 
     frappe.sendmail(
         recipients=[to_email],
@@ -263,8 +277,9 @@ def _send_refund_email(invoice_name: str, company_abbr: str, refund_payload: dic
         add_unsubscribe_link=0,
         reference_doctype="Sales Invoice",
         reference_name=invoice_name,
+        attachments=[refund_pdf] if refund_pdf else None,
     )
-    return {"sent": True, "template": template_name, "to": to_email}
+    return {"sent": True, "template": template_name, "to": to_email, "has_attachment": bool(refund_pdf)}
 
 
 @frappe.whitelist()
