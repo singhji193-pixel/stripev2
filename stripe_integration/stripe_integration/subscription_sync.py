@@ -204,16 +204,15 @@ def _generate_subscription_setup_checkout_url(sub_doc, company_abbr: str, to_ema
     # Create a fresh setup-mode Checkout Session so customer adds a payment method
     # without immediate charge. This avoids stale/expired one-time payment links.
     stripe_sub_id = sub_doc.get("stripe_subscription_id")
-    if not stripe_sub_id:
-        return ""
     _set_api_key_for_company(sub_doc.get("company"))
 
     stripe_customer_id = None
-    try:
-        remote_sub = stripe.Subscription.retrieve(stripe_sub_id)
-        stripe_customer_id = getattr(remote_sub, "customer", None)
-    except Exception:
-        stripe_customer_id = None
+    if stripe_sub_id:
+        try:
+            remote_sub = stripe.Subscription.retrieve(stripe_sub_id)
+            stripe_customer_id = getattr(remote_sub, "customer", None)
+        except Exception:
+            stripe_customer_id = None
 
     success_url = get_url() + "/api/method/stripe_integration.stripe_integration.api.payment_success?subscription=" + sub_doc.name
     cancel_url = get_url() + "/api/method/stripe_integration.stripe_integration.api.payment_cancelled?subscription=" + sub_doc.name
@@ -242,7 +241,16 @@ def _generate_subscription_setup_checkout_url(sub_doc, company_abbr: str, to_ema
     elif to_email:
         params["customer_email"] = to_email
 
-    session = stripe.checkout.Session.create(**params)
+    try:
+        session = stripe.checkout.Session.create(**params)
+    except Exception as e:
+        # Retry without customer_email if Stripe rejects malformed/invalid address.
+        if params.get("customer_email"):
+            params.pop("customer_email", None)
+            session = stripe.checkout.Session.create(**params)
+        else:
+            raise e
+
     checkout_url = session.get("url")
 
     if checkout_url:
@@ -436,6 +444,39 @@ def sync_subscription_action(subscription_name: str, action: str):
         return {"handled": False, "reason": "subscription_sync_disabled"}
     sub = frappe.get_doc("Subscription", subscription_name)
     return _sync_subscription(sub, action)
+
+
+@frappe.whitelist()
+def request_subscription_payment_method(subscription_name: str, send_email: int = 1):
+    sub = frappe.get_doc("Subscription", subscription_name)
+    company_abbr = _set_api_key_for_company(sub.company)
+    to_email = _resolve_subscription_email(sub)
+    checkout_url = _generate_subscription_setup_checkout_url(sub, company_abbr, to_email=to_email)
+
+    if not checkout_url:
+        return {
+            "ok": False,
+            "reason": "setup_checkout_url_missing",
+            "subscription": subscription_name,
+        }
+
+    out = {
+        "ok": True,
+        "subscription": subscription_name,
+        "checkout_url": checkout_url,
+        "email_sent": False,
+        "stripe_subscription_linked": bool(getattr(sub, "stripe_subscription_id", None)),
+    }
+
+    if int(send_email or 0):
+        try:
+            email_out = _send_lifecycle_email(subscription_name, company_abbr, "add_payment_method", {})
+            out["email"] = email_out
+            out["email_sent"] = bool((email_out or {}).get("sent"))
+        except Exception as e:
+            out["email"] = {"sent": False, "reason": str(e)[:300]}
+
+    return out
 
 
 def queue_subscription_action(subscription_name: str, action: str):

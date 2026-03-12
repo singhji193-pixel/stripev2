@@ -1,16 +1,11 @@
 frappe.ui.form.on("Subscription", {
   refresh(frm) {
     removeLegacyButtons(frm);
+    stripLegacyActionMenuDom();
+    setTimeout(() => { removeLegacyButtons(frm); stripLegacyActionMenuDom(); }, 200);
+    setTimeout(() => { removeLegacyButtons(frm); stripLegacyActionMenuDom(); }, 900);
 
-    frm.add_custom_button(__("Stripe: Pause"), () => runStripeAction(frm, "pause"));
-    frm.add_custom_button(__("Stripe: Resume"), () => runStripeAction(frm, "resume"));
-    frm.add_custom_button(__("Stripe: Cancel"), () => {
-      frappe.confirm(
-        __("Cancel this subscription in Stripe? This cannot be undone."),
-        () => runStripeAction(frm, "cancel")
-      );
-    });
-
+    frm.add_custom_button(__("Stripe: Request Payment Method"), () => requestPaymentMethod(frm));
     frm.add_custom_button(__("Stripe: View Sync Log"), () => showSyncLog(frm));
   }
 });
@@ -20,41 +15,69 @@ function removeLegacyButtons(frm) {
   [
     __("Fetch Subscription Updates"),
     __("Force-Fetch Subscription Updates"),
-    __("Cancel Subscription")
+    __("Cancel Subscription"),
+    __("Stripe: Pause"),
+    __("Stripe: Resume"),
+    __("Stripe: Cancel"),
+    "Fetch Subscription Updates",
+    "Force-Fetch Subscription Updates",
+    "Cancel Subscription",
+    "Stripe: Pause",
+    "Stripe: Resume",
+    "Stripe: Cancel"
   ].forEach((label) => {
     try { frm.remove_custom_button(label); } catch (e) {}
+    try { frm.page.remove_inner_button(label); } catch (e) {}
+    try { frm.page.remove_menu_item(label); } catch (e) {}
+    try { frm.page.remove_action_item(label); } catch (e) {}
   });
 }
 
-function runStripeAction(frm, action) {
-  if (!frm.doc.stripe_subscription_id) {
-    frappe.msgprint({
-      title: __("Missing Stripe Subscription ID"),
-      indicator: "orange",
-      message: __("This subscription is not linked to Stripe yet. Set stripe_subscription_id first, then retry.")
-    });
-    return;
-  }
+function stripLegacyActionMenuDom() {
+  const blocked = [
+    "Fetch Subscription Updates",
+    "Force-Fetch Subscription Updates",
+    "Cancel Subscription",
+    "Stripe: Pause",
+    "Stripe: Resume",
+    "Stripe: Cancel"
+  ];
 
+  document.querySelectorAll('.dropdown-menu .dropdown-item, .actions-btn-group .btn, .menu-item').forEach((el) => {
+    const t = (el.textContent || '').trim();
+    if (blocked.includes(t)) {
+      el.style.display = 'none';
+      try { el.remove(); } catch (e) {}
+    }
+  });
+}
+
+function requestPaymentMethod(frm) {
   frappe.call({
-    method: "stripe_integration.stripe_integration.subscription_sync.sync_subscription_action",
+    method: "stripe_integration.stripe_integration.subscription_sync.request_subscription_payment_method",
     args: {
       subscription_name: frm.doc.name,
-      action
+      send_email: 1
     },
     freeze: true,
-    freeze_message: __("Syncing subscription with Stripe..."),
+    freeze_message: __("Generating setup link and sending email..."),
     callback: (r) => {
       const out = r.message || {};
-      if (out.handled) {
-        frappe.show_alert({ message: __("Stripe sync completed: {0}", [action]), indicator: "green" });
-      } else {
+      if (!out.ok) {
         frappe.msgprint({
-          title: __("Stripe Sync Not Applied"),
+          title: __("Stripe"),
           indicator: "orange",
           message: __("Reason: {0}", [out.reason || "unknown"])
         });
+        return;
       }
+
+      const link = out.checkout_url || "";
+      frappe.msgprint({
+        title: __("Payment Method Request"),
+        indicator: "green",
+        message: `<div><a href="${link}" target="_blank">${link}</a><br><br>${out.email_sent ? "Email sent to customer." : "Link generated."}</div>`
+      });
       frm.reload_doc();
     }
   });
