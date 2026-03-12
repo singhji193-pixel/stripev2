@@ -2,6 +2,7 @@ import frappe
 import stripe
 
 from frappe.utils import flt, get_url, now, fmt_money
+from frappe.utils.password import check_password
 
 from stripe_integration.stripe_integration.utils import (
     get_api_key,
@@ -9,9 +10,31 @@ from stripe_integration.stripe_integration.utils import (
 )
 
 
+STRIPE_ACTION_ROLES = ("System Manager", "Accounts Manager", "Accounts User")
+
+
 def _require_doc_permission(doctype: str, name: str, ptype: str = "write"):
     if not frappe.has_permission(doctype, ptype=ptype, doc=name):
         frappe.throw("Not permitted", frappe.PermissionError)
+
+
+def _require_stripe_action_guard(gate_password: str = None):
+    if not any(frappe.has_role(role) for role in STRIPE_ACTION_ROLES):
+        frappe.throw("Not permitted", frappe.PermissionError)
+
+    # Optional password gate from Stripe Settings. If no password is configured, only role+doc perms apply.
+    settings = frappe.get_cached_doc("Stripe Settings", "Stripe Settings")
+    configured = settings.get_password("stripe_action_password")
+    if not configured:
+        return
+
+    if not gate_password:
+        frappe.throw("Approval password is required", frappe.PermissionError)
+
+    try:
+        check_password("Stripe Settings", "Stripe Settings", gate_password, "stripe_action_password")
+    except frappe.AuthenticationError:
+        frappe.throw("Invalid approval password", frappe.PermissionError)
 
 
 def _get_recipient_email(doc):
@@ -194,7 +217,7 @@ def _send_payment_email(
 
 
 @frappe.whitelist()
-def void_payment_link_stripe(invoice_name: str):
+def void_payment_link_stripe(invoice_name: str, gate_password: str = None):
     """Void an active Stripe checkout link for a submitted Sales Invoice.
 
     - Checkout Session: expire session
@@ -203,6 +226,7 @@ def void_payment_link_stripe(invoice_name: str):
 
     doctype = "Sales Invoice"
     _require_doc_permission(doctype, invoice_name, "write")
+    _require_stripe_action_guard(gate_password)
 
     inv = frappe.get_doc(doctype, invoice_name)
     if inv.docstatus != 1:
@@ -250,7 +274,7 @@ def void_payment_link_stripe(invoice_name: str):
 
 
 @frappe.whitelist()
-def request_payment_stripe(invoice_name: str):
+def request_payment_stripe(invoice_name: str, gate_password: str = None):
     """Default: Stripe Checkout Session (hosted). Fallback: Stripe Payment Link.
 
     Uses custom fields on Sales Invoice (Address & Contact -> Payment Configuration).
@@ -258,6 +282,7 @@ def request_payment_stripe(invoice_name: str):
 
     doctype = "Sales Invoice"
     _require_doc_permission(doctype, invoice_name, "write")
+    _require_stripe_action_guard(gate_password)
 
     inv = frappe.get_doc(doctype, invoice_name)
     if inv.docstatus != 1:
