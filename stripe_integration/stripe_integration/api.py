@@ -20,7 +20,8 @@ def _require_doc_permission(doctype: str, name: str, ptype: str = "write"):
 
 
 def _require_stripe_action_guard(gate_password: str = None):
-    if not any(frappe.has_role(role) for role in STRIPE_ACTION_ROLES):
+    user_roles = set(frappe.get_roles(frappe.session.user))
+    if not any(role in user_roles for role in STRIPE_ACTION_ROLES):
         frappe.throw("Not permitted", frappe.PermissionError)
 
     # Optional password gate from Stripe Settings. If no password is configured, only role+doc perms apply.
