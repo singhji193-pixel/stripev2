@@ -1,5 +1,20 @@
 frappe.ui.form.on("Sales Invoice", {
   refresh(frm) {
+    // Keep print output brand-correct per company inside the ERP Print action.
+    // Frappe stores this per-user as last_print_format for the doctype.
+    const company = (frm.doc.company || "").trim();
+    const desiredPrintFormat = company === "COEngine Service Inc."
+      ? "COEngine Beautiful Invoice"
+      : company === "CoreOrbit Systems Ltd."
+        ? "CoreOrbit Beautiful Invoice"
+        : null;
+
+    if (desiredPrintFormat) {
+      frappe.model.user_settings.save("Sales Invoice", {
+        last_print_format: desiredPrintFormat
+      });
+    }
+
     if (frm.doc.docstatus !== 1) return;
 
     const allowedRoles = ["System Manager", "Accounts Manager", "Accounts User"];
