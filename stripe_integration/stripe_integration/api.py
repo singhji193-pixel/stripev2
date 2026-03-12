@@ -12,6 +12,7 @@ from stripe_integration.stripe_integration.refunds import apply_refund_to_erp
 
 
 STRIPE_ACTION_ROLES = ("System Manager", "Accounts Manager", "Accounts User")
+CREDIT_NOTE_REQUIRED_ERROR_CODE = "credit_note_required_before_refund"
 
 
 def _require_doc_permission(doctype: str, name: str, ptype: str = "write"):
@@ -248,6 +249,30 @@ def _build_refund_pdf_attachment(invoice_name: str, company_abbr: str):
         return None
 
 
+def _has_submitted_credit_note(invoice_name: str) -> bool:
+    return bool(
+        frappe.db.exists(
+            "Sales Invoice",
+            {
+                "docstatus": 1,
+                "is_return": 1,
+                "return_against": invoice_name,
+            },
+        )
+    )
+
+
+def _require_submitted_credit_note(invoice_name: str):
+    if _has_submitted_credit_note(invoice_name):
+        return
+
+    frappe.throw(
+        f"{CREDIT_NOTE_REQUIRED_ERROR_CODE}: Submit a Credit Note linked to this invoice before running Stripe refund.",
+        frappe.ValidationError,
+        title=CREDIT_NOTE_REQUIRED_ERROR_CODE,
+    )
+
+
 def _send_refund_email(invoice_name: str, company_abbr: str, refund_payload: dict):
     to_email = _get_recipient_email(frappe.get_doc("Sales Invoice", invoice_name))
     if not to_email:
@@ -352,6 +377,7 @@ def refund_payment_stripe(invoice_name: str, gate_password: str = None, reason: 
 
     Notes:
     - This endpoint currently supports full refunds only (small/safe scope for PR2).
+    - A submitted Credit Note (return Sales Invoice against this invoice) is required before Stripe refund.
     - ERP linkage is done by cancelling the matching submitted Payment Entry.
     """
 
@@ -362,6 +388,8 @@ def refund_payment_stripe(invoice_name: str, gate_password: str = None, reason: 
     inv = frappe.get_doc(doctype, invoice_name)
     if inv.docstatus != 1:
         frappe.throw("Invoice must be Submitted before refunding")
+
+    _require_submitted_credit_note(invoice_name)
 
     pi_id = inv.get("stripe_payment_intent_id")
     if not pi_id:
