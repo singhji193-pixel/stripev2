@@ -93,7 +93,7 @@ def _require_doc_permission(doctype: str, name: str, ptype: str = "write"):
         frappe.throw("Not permitted", frappe.PermissionError)
 
 
-def _require_stripe_action_guard(gate_password: str = None, invoice_name: str = None):
+def _require_stripe_action_guard(gate_password: str = None, invoice_name: str = None, require_password: bool = True):
     user_roles = set(frappe.get_roles(frappe.session.user))
     if not any(role in user_roles for role in STRIPE_ACTION_ROLES):
         _log_refund_security_audit(
@@ -114,19 +114,22 @@ def _require_stripe_action_guard(gate_password: str = None, invoice_name: str = 
     # Optional password gate from Stripe Settings. If no password is configured, only role+doc perms apply.
     # Use __Auth existence check to avoid noisy "Password not found..." server messages.
     has_gate = bool(
-        frappe.db.get_value(
+        frappe.db.exists(
             "__Auth",
             {
                 "doctype": "Stripe Settings",
                 "name": "Stripe Settings",
                 "fieldname": "stripe_action_password",
             },
-            "name",
         )
     )
 
-    if not has_gate:
-        _log_refund_security_audit(invoice_name, check="password_gate", outcome="skipped_not_configured")
+    if (not require_password) or (not has_gate):
+        _log_refund_security_audit(
+            invoice_name,
+            check="password_gate",
+            outcome="skipped_not_required" if not require_password else "skipped_not_configured",
+        )
         return
 
     if not gate_password:
@@ -469,7 +472,7 @@ def void_payment_link_stripe(invoice_name: str, gate_password: str = None):
 
     doctype = "Sales Invoice"
     _require_doc_permission(doctype, invoice_name, "write")
-    _require_stripe_action_guard(gate_password, invoice_name=invoice_name)
+    _require_stripe_action_guard(gate_password, invoice_name=invoice_name, require_password=False)
 
     inv = frappe.get_doc(doctype, invoice_name)
     if inv.docstatus != 1:
@@ -627,7 +630,7 @@ def request_payment_stripe(invoice_name: str, gate_password: str = None):
 
     doctype = "Sales Invoice"
     _require_doc_permission(doctype, invoice_name, "write")
-    _require_stripe_action_guard(gate_password, invoice_name=invoice_name)
+    _require_stripe_action_guard(gate_password, invoice_name=invoice_name, require_password=False)
 
     inv = frappe.get_doc(doctype, invoice_name)
     if inv.docstatus != 1:
