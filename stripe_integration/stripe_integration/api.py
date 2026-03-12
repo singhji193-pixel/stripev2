@@ -8,6 +8,7 @@ from stripe_integration.stripe_integration.utils import (
     get_api_key,
     get_company_abbr_from_company,
 )
+from stripe_integration.stripe_integration.refunds import apply_refund_to_erp
 
 
 STRIPE_ACTION_ROLES = ("System Manager", "Accounts Manager", "Accounts User")
@@ -271,6 +272,74 @@ def void_payment_link_stripe(invoice_name: str, gate_password: str = None):
     frappe.db.commit()
 
     return result
+
+
+@frappe.whitelist()
+def refund_payment_stripe(invoice_name: str, gate_password: str = None, reason: str = "requested_by_customer"):
+    """Create a full Stripe refund for the invoice's latest Stripe payment and mirror it in ERP.
+
+    Notes:
+    - This endpoint currently supports full refunds only (small/safe scope for PR2).
+    - ERP linkage is done by cancelling the matching submitted Payment Entry.
+    """
+
+    doctype = "Sales Invoice"
+    _require_doc_permission(doctype, invoice_name, "write")
+    _require_stripe_action_guard(gate_password)
+
+    inv = frappe.get_doc(doctype, invoice_name)
+    if inv.docstatus != 1:
+        frappe.throw("Invoice must be Submitted before refunding")
+
+    pi_id = inv.get("stripe_payment_intent_id")
+    if not pi_id:
+        frappe.throw("No Stripe payment intent found for this invoice")
+
+    company = inv.get("company")
+    company_abbr = get_company_abbr_from_company(company)
+    if not company_abbr:
+        frappe.throw("Could not determine company abbr from invoice")
+
+    stripe.api_key = get_api_key(company_abbr)
+
+    payment = stripe.PaymentIntent.retrieve(pi_id)
+    amount_received = float((payment.get("amount_received") or 0) / 100.0)
+    currency = (payment.get("currency") or inv.get("currency") or "CAD").upper()
+
+    if amount_received <= 0:
+        frappe.throw("Stripe payment has no received amount to refund")
+
+    refund = stripe.Refund.create(
+        payment_intent=pi_id,
+        reason=reason or "requested_by_customer",
+        metadata={
+            "doctype": "Sales Invoice",
+            "docname": invoice_name,
+            "company": company,
+            "company_abbr": company_abbr,
+            "site": frappe.local.site,
+            "source": "erp_manual_refund",
+        },
+    )
+
+    linked = apply_refund_to_erp(
+        stripe_payment_intent_id=pi_id,
+        stripe_refund_id=refund.get("id"),
+        refund_amount=float((refund.get("amount") or 0) / 100.0),
+        currency=(refund.get("currency") or currency).upper(),
+        source="api.refund_payment_stripe",
+    )
+
+    return {
+        "ok": True,
+        "invoice": invoice_name,
+        "payment_intent": pi_id,
+        "refund_id": refund.get("id"),
+        "refund_status": refund.get("status"),
+        "amount": float((refund.get("amount") or 0) / 100.0),
+        "currency": (refund.get("currency") or currency).upper(),
+        "erp_linkage": linked,
+    }
 
 
 @frappe.whitelist()
