@@ -13,6 +13,8 @@ REQUIRED_TEMPLATES = [
     "Stripe COEngine Subscription Cancelled",
     "Stripe COEngine Payment Request",
     "Stripe Payment Receipt Branded",
+    "Stripe CoreOrbit Refund Processed",
+    "Stripe COEngine Refund Processed",
 ]
 
 REQUIRED_SUB_FIELDS = [
