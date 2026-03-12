@@ -44,6 +44,49 @@ WEBHOOK_RATE_LIMIT_WINDOW_SECONDS = 60
 WEBHOOK_RATE_LIMIT_MAX_PER_IP = 120
 WEBHOOK_GLOBAL_RATE_LIMIT_WINDOW_SECONDS = 600
 WEBHOOK_GLOBAL_RATE_LIMIT_MAX = 1000
+WEBHOOK_ACCOUNT_ABBRS = ("COE", "COSL")
+
+
+def _normalize_company_abbr(value: str | None) -> str | None:
+    v = (value or "").strip().upper()
+    return v or None
+
+
+def _extract_event_metadata(event: dict | None) -> dict:
+    return (((event or {}).get("data") or {}).get("object") or {}).get("metadata") or {}
+
+
+def _extract_claimed_company_abbr(event: dict | None) -> str | None:
+    metadata = _extract_event_metadata(event)
+
+    company_abbr = _normalize_company_abbr(metadata.get("company_abbr"))
+    if company_abbr:
+        return company_abbr
+
+    company_name = (metadata.get("company") or "").strip()
+    if not company_name:
+        return None
+
+    try:
+        return _normalize_company_abbr(get_company_abbr_from_company(company_name))
+    except Exception:
+        return None
+
+
+def _extract_doc_company_abbr(event: dict | None) -> str | None:
+    metadata = _extract_event_metadata(event)
+    doctype = (metadata.get("doctype") or "").strip()
+    docname = (metadata.get("docname") or "").strip()
+    if not doctype or not docname:
+        return None
+
+    try:
+        company = frappe.db.get_value(doctype, docname, "company")
+        if not company:
+            return None
+        return _normalize_company_abbr(get_company_abbr_from_company(company))
+    except Exception:
+        return None
 
 
 def _mask_identifier(value: str, keep_prefix: int = 6, keep_suffix: int = 4) -> str:
@@ -88,7 +131,7 @@ def _sanitize_for_log(data, depth: int = 0):
     return data
 
 
-def _build_safe_payload_text(payload: bytes, event: dict | None) -> str:
+def _build_safe_payload_text(payload: bytes, event: dict | None, matched_company_abbr: str | None = None) -> str:
     payload_hash = hashlib.sha256(payload or b"").hexdigest()
     size = len(payload or b"")
 
@@ -96,6 +139,8 @@ def _build_safe_payload_text(payload: bytes, event: dict | None) -> str:
         "payload_hash": payload_hash,
         "payload_size": size,
     }
+    if matched_company_abbr:
+        base["matched_company_abbr"] = matched_company_abbr
 
     if not event:
         return json.dumps(base, default=str)
@@ -248,12 +293,14 @@ def handle_webhook():
     sig_header = frappe.get_request_header("Stripe-Signature")
 
     event = None
-    for abbr in ["COE", "COSL"]:
+    matched_company_abbr = None
+    for abbr in WEBHOOK_ACCOUNT_ABBRS:
         endpoint_secret = get_webhook_secret(abbr)
         if not endpoint_secret:
             continue
         try:
             event = stripe.Webhook.construct_event(payload, sig_header, endpoint_secret)
+            matched_company_abbr = _normalize_company_abbr(abbr)
             break
         except Exception:
             continue
@@ -265,15 +312,23 @@ def handle_webhook():
 
     event_id = event.get("id")
     event_type = event.get("type")
-    safe_payload_text = _build_safe_payload_text(payload, event)
+    claimed_company_abbr = _extract_claimed_company_abbr(event)
+    doc_company_abbr = _extract_doc_company_abbr(event)
 
-    company_abbr = None
-    try:
-        metadata = (event.get("data", {}).get("object", {}) or {}).get("metadata", {}) or {}
-        company_abbr = metadata.get("company_abbr")
-    except Exception:
-        company_abbr = None
+    if claimed_company_abbr and matched_company_abbr and claimed_company_abbr != matched_company_abbr:
+        frappe.response.status_code = 400
+        return {"status": "account_mismatch", "reason": "metadata_company_abbr_mismatch"}
 
+    if doc_company_abbr and matched_company_abbr and doc_company_abbr != matched_company_abbr:
+        frappe.response.status_code = 400
+        return {"status": "account_mismatch", "reason": "document_company_abbr_mismatch"}
+
+    if claimed_company_abbr and doc_company_abbr and claimed_company_abbr != doc_company_abbr:
+        frappe.response.status_code = 400
+        return {"status": "company_mismatch", "reason": "metadata_vs_document_mismatch"}
+
+    company_abbr = claimed_company_abbr or doc_company_abbr or matched_company_abbr
+    safe_payload_text = _build_safe_payload_text(payload, event, matched_company_abbr=matched_company_abbr)
 
     if event_id and _integration_request_is_completed(event_id):
         return {"status": "ok", "idempotent": True}
