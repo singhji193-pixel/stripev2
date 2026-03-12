@@ -67,7 +67,7 @@ frappe.ui.form.on("Sales Invoice", {
     if (canRefund) {
       frm.add_custom_button("Refund Stripe Payment", () => {
         frappe.confirm(
-          "This creates a full Stripe refund and cancels the linked ERP Payment Entry. Continue?",
+          "This creates a Stripe refund and cancels the linked ERP Payment Entry. A submitted Credit Note is required first. Continue?",
           () => {
             withPasswordGate((gatePassword) => {
               frappe.call({
@@ -91,10 +91,15 @@ frappe.ui.form.on("Sales Invoice", {
                   });
                   frm.reload_doc();
                 },
-                error: () => {
+                error: (err) => {
+                  let message = "Error calling server method. Check Error Log.";
+                  const raw = err?.message || err?.responseJSON?._server_messages || "";
+                  if (String(raw).includes("credit_note_required_before_refund")) {
+                    message = "Submit a Credit Note linked to this invoice before running Stripe refund.";
+                  }
                   frappe.msgprint({
                     title: "Stripe",
-                    message: "Error calling server method. Check Error Log.",
+                    message,
                     indicator: "red"
                   });
                 }
