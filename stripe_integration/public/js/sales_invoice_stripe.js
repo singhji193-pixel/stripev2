@@ -63,6 +63,48 @@ frappe.ui.form.on("Sales Invoice", {
       }, "Payments");
     }
 
+    const canRefund = !!frm.doc.stripe_payment_intent_id && (frm.doc.paid_amount || 0) > 0;
+    if (canRefund) {
+      frm.add_custom_button("Refund Stripe Payment", () => {
+        frappe.confirm(
+          "This creates a full Stripe refund and cancels the linked ERP Payment Entry. Continue?",
+          () => {
+            withPasswordGate((gatePassword) => {
+              frappe.call({
+                method: "stripe_integration.stripe_integration.api.refund_payment_stripe",
+                args: { invoice_name: frm.doc.name, gate_password: gatePassword },
+                freeze: true,
+                freeze_message: "Creating Stripe refund...",
+                callback: (r) => {
+                  const res = r.message || {};
+                  if (!res.ok) {
+                    frappe.msgprint({
+                      title: "Stripe",
+                      message: "Failed to refund payment. Check Error Log.",
+                      indicator: "red"
+                    });
+                    return;
+                  }
+                  frappe.show_alert({
+                    message: `Refund ${res.refund_id || ""} created (${res.currency} ${res.amount})`,
+                    indicator: "green"
+                  });
+                  frm.reload_doc();
+                },
+                error: () => {
+                  frappe.msgprint({
+                    title: "Stripe",
+                    message: "Error calling server method. Check Error Log.",
+                    indicator: "red"
+                  });
+                }
+              });
+            });
+          }
+        );
+      }, "Payments");
+    }
+
     if ((frm.doc.outstanding_amount || 0) <= 0) return;
     if (frm.doc.status === "Paid") return;
 

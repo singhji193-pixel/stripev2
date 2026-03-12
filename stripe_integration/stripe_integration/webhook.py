@@ -14,6 +14,7 @@ from stripe_integration.stripe_integration.subscription_sync import (
     SETUP_INTENT_FIELD,
 )
 from stripe_integration.stripe_integration.payout_sync import sync_payout_from_webhook_event
+from stripe_integration.stripe_integration.refunds import apply_refund_to_erp
 
 
 def _integration_request_is_completed(event_id: str) -> bool:
@@ -137,6 +138,8 @@ def handle_webhook():
             handle_invoice_paid(event)
         elif event_type.startswith("customer.subscription.") and event_type not in ("customer.subscription.created", "customer.subscription.trial_will_end"):
             sync_subscription_from_webhook_event(event)
+        elif event_type in ("charge.refunded", "refund.updated"):
+            _handle_refund_event(event)
         elif event_type.startswith("payout."):
             sync_payout_from_webhook_event(event)
 
@@ -238,6 +241,45 @@ def _handle_subscription_setup_session(session: dict):
             SETUP_PM_FIELD: payment_method,
             SETUP_INTENT_FIELD: setup_intent_id,
         },
+    )
+
+
+def _handle_refund_event(event: dict):
+    obj = (event or {}).get("data", {}).get("object", {}) or {}
+    event_type = (event or {}).get("type")
+
+    # charge.refunded carries charge object with `refunds.data[*]` and `payment_intent`
+    # refund.updated carries refund object directly.
+    if event_type == "refund.updated":
+        if (obj.get("status") or "") != "succeeded":
+            return {"handled": True, "reason": "refund_not_succeeded"}
+        stripe_pi_id = obj.get("payment_intent")
+        stripe_refund_id = obj.get("id")
+        refund_amount = float((obj.get("amount") or 0) / 100.0)
+        currency = (obj.get("currency") or "").upper() or "CAD"
+        return apply_refund_to_erp(
+            stripe_payment_intent_id=stripe_pi_id,
+            stripe_refund_id=stripe_refund_id,
+            refund_amount=refund_amount,
+            currency=currency,
+            source="webhook.refund.updated",
+        )
+
+    stripe_pi_id = obj.get("payment_intent")
+    refunds = ((obj.get("refunds") or {}).get("data") or [])
+    if not refunds:
+        return {"handled": True, "reason": "no_refund_items"}
+
+    refund = refunds[-1]
+    if (refund.get("status") or "") != "succeeded":
+        return {"handled": True, "reason": "latest_refund_not_succeeded"}
+
+    return apply_refund_to_erp(
+        stripe_payment_intent_id=stripe_pi_id,
+        stripe_refund_id=refund.get("id"),
+        refund_amount=float((refund.get("amount") or 0) / 100.0),
+        currency=(refund.get("currency") or "").upper() or "CAD",
+        source="webhook.charge.refunded",
     )
 
 
