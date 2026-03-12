@@ -33,6 +33,22 @@ def _find_matching_payment_entry(stripe_payment_intent_id: str):
     return None
 
 
+def _find_submitted_credit_note(invoice_name: str):
+    if not invoice_name:
+        return None
+
+    return frappe.db.get_value(
+        "Sales Invoice",
+        {
+            "docstatus": 1,
+            "is_return": 1,
+            "return_against": invoice_name,
+        },
+        "name",
+        order_by="modified desc",
+    )
+
+
 def _comment_on_invoice(invoice_name: str, text: str):
     if not invoice_name:
         return
@@ -41,6 +57,54 @@ def _comment_on_invoice(invoice_name: str, text: str):
         si.add_comment("Comment", text)
     except Exception:
         frappe.log_error(frappe.get_traceback(), "Stripe refund: unable to add Sales Invoice comment")
+
+
+def _create_refund_payment_entry(credit_note_name: str, stripe_payment_intent_id: str, stripe_refund_id: str, refund_amount: float):
+    """Create a refund-side Payment Entry allocated to submitted Credit Note.
+
+    Keeps automation ERP-safe: only create if credit note exists and amount is positive.
+    """
+
+    if not credit_note_name or flt(refund_amount) <= 0:
+        return None
+
+    try:
+        from erpnext.accounts.doctype.payment_entry.payment_entry import get_payment_entry
+
+        pe = get_payment_entry("Sales Invoice", credit_note_name)
+
+        reference_no = stripe_payment_intent_id or stripe_refund_id
+        if reference_no:
+            pe.reference_no = reference_no
+
+        if getattr(frappe.utils, "nowdate", None):
+            pe.reference_date = frappe.utils.nowdate()
+
+        amount = flt(refund_amount)
+        if hasattr(pe, "paid_amount"):
+            pe.paid_amount = amount
+        if hasattr(pe, "received_amount"):
+            pe.received_amount = amount
+
+        if getattr(pe, "references", None):
+            allocated = False
+            for ref in pe.references:
+                if (
+                    getattr(ref, "reference_doctype", None) == "Sales Invoice"
+                    and getattr(ref, "reference_name", None) == credit_note_name
+                ):
+                    ref.allocated_amount = amount
+                    allocated = True
+                    break
+            if not allocated and pe.references:
+                pe.references[0].allocated_amount = amount
+
+        pe.insert(ignore_permissions=True)
+        pe.submit()
+        return pe.name
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "Stripe partial refund: credit note allocation failed")
+        return None
 
 
 def apply_refund_to_erp(
@@ -52,9 +116,10 @@ def apply_refund_to_erp(
 ):
     """Link Stripe refund into ERP records.
 
-    Current behavior (intentionally small/safe scope):
+    Behavior:
     - Full refund => cancel matching submitted Payment Entry
-    - Partial refund => record comment + explicit manual action hint
+    - Partial refund => try credit-note allocation via refund Payment Entry
+      and fallback to manual adjustment comment when allocation is not possible.
     """
 
     refund_amount = flt(refund_amount)
@@ -79,6 +144,35 @@ def apply_refund_to_erp(
 
     epsilon = 0.01
     if refund_amount + epsilon < paid_amount:
+        credit_note_name = _find_submitted_credit_note(invoice_name)
+        if credit_note_name:
+            refund_pe_name = _create_refund_payment_entry(
+                credit_note_name=credit_note_name,
+                stripe_payment_intent_id=stripe_payment_intent_id,
+                stripe_refund_id=stripe_refund_id,
+                refund_amount=refund_amount,
+            )
+            if refund_pe_name:
+                _comment_on_invoice(
+                    invoice_name,
+                    (
+                        f"Stripe partial refund auto-linked ({currency} {refund_amount:.2f}, "
+                        f"refund {stripe_refund_id}, source {source}) for PI {stripe_payment_intent_id}. "
+                        f"Created refund Payment Entry {refund_pe_name} allocated to Credit Note {credit_note_name}."
+                    ),
+                )
+                frappe.db.commit()
+                return {
+                    "handled": True,
+                    "mode": "partial_refund_credit_note_allocated",
+                    "payment_entry": pe.name,
+                    "refund_payment_entry": refund_pe_name,
+                    "invoice": invoice_name,
+                    "credit_note": credit_note_name,
+                    "refund_amount": refund_amount,
+                    "paid_amount": paid_amount,
+                }
+
         _comment_on_invoice(
             invoice_name,
             (
@@ -92,6 +186,7 @@ def apply_refund_to_erp(
             "mode": "partial_refund_manual_adjustment_required",
             "payment_entry": pe.name,
             "invoice": invoice_name,
+            "credit_note": credit_note_name,
             "refund_amount": refund_amount,
             "paid_amount": paid_amount,
         }
