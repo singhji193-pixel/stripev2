@@ -26,7 +26,11 @@ def _require_stripe_action_guard(gate_password: str = None):
 
     # Optional password gate from Stripe Settings. If no password is configured, only role+doc perms apply.
     settings = frappe.get_cached_doc("Stripe Settings", "Stripe Settings")
-    configured = settings.get_password("stripe_action_password")
+    try:
+        configured = settings.get_password("stripe_action_password")
+    except Exception:
+        configured = None
+
     if not configured:
         return
 
