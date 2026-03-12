@@ -1,3 +1,5 @@
+import time
+
 import frappe
 import stripe
 
@@ -13,6 +15,52 @@ from stripe_integration.stripe_integration.refunds import apply_refund_to_erp
 
 STRIPE_ACTION_ROLES = ("System Manager", "Accounts Manager", "Accounts User")
 CREDIT_NOTE_REQUIRED_ERROR_CODE = "credit_note_required_before_refund"
+
+# Abuse-protection defaults (safe baseline; can be adjusted later if needed).
+REFUND_RATE_LIMIT_WINDOW_SECONDS = 60
+REFUND_RATE_LIMIT_MAX_ATTEMPTS = 5
+
+
+def _cache_get():
+    cache_fn = getattr(frappe, "cache", None)
+    if callable(cache_fn):
+        return cache_fn()
+    return cache_fn
+
+
+def _cache_inc_with_ttl(key: str, ttl_seconds: int) -> int:
+    cache = _cache_get()
+    if not cache:
+        return 0
+
+    try:
+        cache.incr(key)
+    except Exception:
+        cache.set_value(key, 1, expires_in_sec=ttl_seconds)
+        return 1
+
+    try:
+        cache.expire(key, ttl_seconds)
+    except Exception:
+        pass
+
+    try:
+        return int(cache.get_value(key) or 0)
+    except Exception:
+        return 0
+
+
+def _enforce_refund_rate_limit(invoice_name: str):
+    user = (getattr(getattr(frappe, "session", None), "user", None) or "guest").strip() or "guest"
+    bucket = int(time.time() // REFUND_RATE_LIMIT_WINDOW_SECONDS)
+    key = f"stripe:refund:attempts:{user}:{invoice_name}:{bucket}"
+    attempts = _cache_inc_with_ttl(key, REFUND_RATE_LIMIT_WINDOW_SECONDS + 5)
+
+    if attempts > REFUND_RATE_LIMIT_MAX_ATTEMPTS:
+        frappe.throw(
+            "Too many refund attempts. Please wait a minute and try again.",
+            frappe.PermissionError,
+        )
 
 
 def _require_doc_permission(doctype: str, name: str, ptype: str = "write"):
@@ -409,6 +457,7 @@ def refund_payment_stripe(invoice_name: str, gate_password: str = None, reason: 
     doctype = "Sales Invoice"
     _require_doc_permission(doctype, invoice_name, "write")
     _require_stripe_action_guard(gate_password)
+    _enforce_refund_rate_limit(invoice_name)
 
     inv = frappe.get_doc(doctype, invoice_name)
     if inv.docstatus != 1:

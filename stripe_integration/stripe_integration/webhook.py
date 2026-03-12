@@ -1,5 +1,7 @@
 import json
 import hashlib
+import time
+
 import frappe
 import stripe
 
@@ -35,6 +37,13 @@ SENSITIVE_LOG_FIELDS = {
     "description",
     "receipt_email",
 }
+
+# Webhook abuse-protection defaults.
+WEBHOOK_MAX_PAYLOAD_BYTES = 256 * 1024
+WEBHOOK_RATE_LIMIT_WINDOW_SECONDS = 60
+WEBHOOK_RATE_LIMIT_MAX_PER_IP = 120
+WEBHOOK_GLOBAL_RATE_LIMIT_WINDOW_SECONDS = 600
+WEBHOOK_GLOBAL_RATE_LIMIT_MAX = 1000
 
 
 def _mask_identifier(value: str, keep_prefix: int = 6, keep_suffix: int = 4) -> str:
@@ -102,6 +111,64 @@ def _build_safe_payload_text(payload: bytes, event: dict | None) -> str:
     }
     base["event"] = safe
     return json.dumps(base, default=str)
+
+
+def _cache_get():
+    cache_fn = getattr(frappe, "cache", None)
+    if callable(cache_fn):
+        return cache_fn()
+    return cache_fn
+
+
+def _cache_inc_with_ttl(key: str, ttl_seconds: int) -> int:
+    cache = _cache_get()
+    if not cache:
+        return 0
+
+    try:
+        cache.incr(key)
+    except Exception:
+        cache.set_value(key, 1, expires_in_sec=ttl_seconds)
+        return 1
+
+    try:
+        cache.expire(key, ttl_seconds)
+    except Exception:
+        pass
+
+    try:
+        return int(cache.get_value(key) or 0)
+    except Exception:
+        return 0
+
+
+def _enforce_webhook_rate_limits(payload: bytes):
+    if len(payload or b"") > WEBHOOK_MAX_PAYLOAD_BYTES:
+        frappe.response.status_code = 413
+        return {"status": "payload_too_large"}
+
+    ip = (
+        frappe.get_request_header("X-Forwarded-For")
+        or frappe.get_request_header("CF-Connecting-IP")
+        or getattr(getattr(frappe, "local", None), "request_ip", None)
+        or "unknown"
+    )
+    ip = str(ip).split(",")[0].strip() or "unknown"
+
+    ip_bucket = int(time.time() // WEBHOOK_RATE_LIMIT_WINDOW_SECONDS)
+    global_bucket = int(time.time() // WEBHOOK_GLOBAL_RATE_LIMIT_WINDOW_SECONDS)
+
+    ip_key = f"stripe:webhook:ip:{ip}:{ip_bucket}"
+    global_key = f"stripe:webhook:global:{global_bucket}"
+
+    ip_count = _cache_inc_with_ttl(ip_key, WEBHOOK_RATE_LIMIT_WINDOW_SECONDS + 5)
+    global_count = _cache_inc_with_ttl(global_key, WEBHOOK_GLOBAL_RATE_LIMIT_WINDOW_SECONDS + 5)
+
+    if ip_count > WEBHOOK_RATE_LIMIT_MAX_PER_IP or global_count > WEBHOOK_GLOBAL_RATE_LIMIT_MAX:
+        frappe.response.status_code = 429
+        return {"status": "rate_limited"}
+
+    return None
 
 
 def _integration_request_is_completed(event_id: str) -> bool:
@@ -173,6 +240,11 @@ class _MariaDBNamedLock:
 @frappe.whitelist(allow_guest=True)
 def handle_webhook():
     payload = frappe.request.get_data() or b""
+
+    blocked = _enforce_webhook_rate_limits(payload)
+    if blocked:
+        return blocked
+
     sig_header = frappe.get_request_header("Stripe-Signature")
 
     event = None
