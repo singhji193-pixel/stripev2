@@ -149,6 +149,12 @@ def _brand_name_from_company_abbr(company_abbr: str) -> str:
     return brand
 
 
+def _resolve_sender(company_abbr: str) -> str:
+    if (company_abbr or "").upper() == "COSL":
+        return "CoreOrbit <next@coengine.ai>"
+    return "COEngine <erp@coengine.ai>"
+
+
 def _send_payment_email(
     to_email: str,
     invoice_name: str,
@@ -159,7 +165,7 @@ def _send_payment_email(
     mode_used: str,
     company_abbr: str,
 ):
-    brand_name = _brand_name_from_company_abbr(company_abbr)
+    _brand_name_from_company_abbr(company_abbr)
 
     # Build dynamic args used by template/plain fallback
     payment_type = "partial" if request_kind in ("deposit", "remainder") else "full"
@@ -206,7 +212,7 @@ def _send_payment_email(
         recipients=[to_email],
         subject=rendered_subject,
         message=rendered_message,
-        sender=f"{brand_name} <erp@coengine.ai>",
+        sender=_resolve_sender(company_abbr),
         now=True,
         delayed=False,
         with_container=False,
@@ -215,6 +221,45 @@ def _send_payment_email(
         reference_name=invoice_name,
         attachments=attachments,
     )
+
+
+def _send_refund_email(invoice_name: str, company_abbr: str, refund_payload: dict):
+    to_email = _get_recipient_email(frappe.get_doc("Sales Invoice", invoice_name))
+    if not to_email:
+        return {"sent": False, "reason": "recipient_email_missing"}
+
+    template_name = "Stripe CoreOrbit Refund Processed" if (company_abbr or "").upper() == "COSL" else "Stripe COEngine Refund Processed"
+    if not frappe.db.exists("Email Template", template_name):
+        return {"sent": False, "reason": "template_missing", "template": template_name}
+
+    inv = frappe.get_doc("Sales Invoice", invoice_name)
+    args = {
+        "invoice_name": invoice_name,
+        "customer_name": inv.get("customer_name") or inv.get("customer") or "Customer",
+        "refund_amount": float(refund_payload.get("amount") or 0),
+        "currency": (refund_payload.get("currency") or inv.get("currency") or "CAD").upper(),
+        "refund_id": refund_payload.get("refund_id") or "",
+        "refund_status": refund_payload.get("refund_status") or "",
+        "payment_intent": refund_payload.get("payment_intent") or "",
+    }
+
+    et = frappe.get_doc("Email Template", template_name)
+    subject = frappe.render_template(et.subject or "Refund processed", args)
+    message = frappe.render_template(et.response or "", args)
+
+    frappe.sendmail(
+        recipients=[to_email],
+        subject=subject,
+        message=message,
+        sender=_resolve_sender(company_abbr),
+        now=True,
+        delayed=False,
+        with_container=False,
+        add_unsubscribe_link=0,
+        reference_doctype="Sales Invoice",
+        reference_name=invoice_name,
+    )
+    return {"sent": True, "template": template_name, "to": to_email}
 
 
 @frappe.whitelist()
@@ -322,15 +367,7 @@ def refund_payment_stripe(invoice_name: str, gate_password: str = None, reason: 
         },
     )
 
-    linked = apply_refund_to_erp(
-        stripe_payment_intent_id=pi_id,
-        stripe_refund_id=refund.get("id"),
-        refund_amount=float((refund.get("amount") or 0) / 100.0),
-        currency=(refund.get("currency") or currency).upper(),
-        source="api.refund_payment_stripe",
-    )
-
-    return {
+    result_payload = {
         "ok": True,
         "invoice": invoice_name,
         "payment_intent": pi_id,
@@ -338,8 +375,24 @@ def refund_payment_stripe(invoice_name: str, gate_password: str = None, reason: 
         "refund_status": refund.get("status"),
         "amount": float((refund.get("amount") or 0) / 100.0),
         "currency": (refund.get("currency") or currency).upper(),
-        "erp_linkage": linked,
     }
+
+    linked = apply_refund_to_erp(
+        stripe_payment_intent_id=pi_id,
+        stripe_refund_id=result_payload["refund_id"],
+        refund_amount=result_payload["amount"],
+        currency=result_payload["currency"],
+        source="api.refund_payment_stripe",
+    )
+    result_payload["erp_linkage"] = linked
+
+    try:
+        result_payload["email"] = _send_refund_email(invoice_name, company_abbr, result_payload)
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "Stripe refund email failed")
+        result_payload["email"] = {"sent": False, "reason": "send_failed"}
+
+    return result_payload
 
 
 @frappe.whitelist()
