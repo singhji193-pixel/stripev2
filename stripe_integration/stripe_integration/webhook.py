@@ -1,4 +1,5 @@
 import json
+import hashlib
 import frappe
 import stripe
 
@@ -15,6 +16,92 @@ from stripe_integration.stripe_integration.subscription_sync import (
 )
 from stripe_integration.stripe_integration.payout_sync import sync_payout_from_webhook_event
 from stripe_integration.stripe_integration.refunds import apply_refund_to_erp
+
+
+SENSITIVE_LOG_FIELDS = {
+    "email",
+    "name",
+    "phone",
+    "address",
+    "line1",
+    "line2",
+    "postal_code",
+    "city",
+    "state",
+    "country",
+    "customer_details",
+    "billing_details",
+    "shipping",
+    "description",
+    "receipt_email",
+}
+
+
+def _mask_identifier(value: str, keep_prefix: int = 6, keep_suffix: int = 4) -> str:
+    if not value:
+        return ""
+    value = str(value)
+    if len(value) <= (keep_prefix + keep_suffix):
+        return "***"
+    return f"{value[:keep_prefix]}...{value[-keep_suffix:]}"
+
+
+def _sanitize_for_log(data, depth: int = 0):
+    if depth > 4:
+        return "[truncated]"
+
+    if isinstance(data, dict):
+        out = {}
+        for key, value in data.items():
+            lk = str(key).lower()
+            if lk in SENSITIVE_LOG_FIELDS:
+                out[key] = "[redacted]"
+            elif lk.endswith("_id") and isinstance(value, str):
+                out[key] = _mask_identifier(value)
+            elif lk == "metadata" and isinstance(value, dict):
+                # Keep only integration-routing metadata keys.
+                out[key] = {
+                    mk: value.get(mk)
+                    for mk in ("company_abbr", "doctype", "docname", "request_kind")
+                    if mk in value
+                }
+            else:
+                out[key] = _sanitize_for_log(value, depth + 1)
+        return out
+
+    if isinstance(data, list):
+        # Keep bounded sample only.
+        return [_sanitize_for_log(v, depth + 1) for v in data[:5]]
+
+    if isinstance(data, str):
+        return data if len(data) <= 120 else f"{data[:120]}...[truncated]"
+
+    return data
+
+
+def _build_safe_payload_text(payload: bytes, event: dict | None) -> str:
+    payload_hash = hashlib.sha256(payload or b"").hexdigest()
+    size = len(payload or b"")
+
+    base = {
+        "payload_hash": payload_hash,
+        "payload_size": size,
+    }
+
+    if not event:
+        return json.dumps(base, default=str)
+
+    safe = {
+        "id": event.get("id"),
+        "type": event.get("type"),
+        "created": event.get("created"),
+        "livemode": event.get("livemode"),
+        "data": {
+            "object": _sanitize_for_log((event.get("data") or {}).get("object") or {}),
+        },
+    }
+    base["event"] = safe
+    return json.dumps(base, default=str)
 
 
 def _integration_request_is_completed(event_id: str) -> bool:
@@ -106,6 +193,7 @@ def handle_webhook():
 
     event_id = event.get("id")
     event_type = event.get("type")
+    safe_payload_text = _build_safe_payload_text(payload, event)
 
     company_abbr = None
     try:
@@ -123,7 +211,7 @@ def handle_webhook():
         req_name = _log_integration_request(
             event_id=event_id,
             status="Queued",
-            payload_text=payload.decode("utf-8", errors="replace"),
+            payload_text=safe_payload_text,
         )
         try:
             upsert_event(event=event, payload=payload, company_abbr=company_abbr, request_id=req_name, status="Queued")
@@ -147,7 +235,7 @@ def handle_webhook():
             _log_integration_request(
                 event_id=event_id,
                 status="Completed",
-                payload_text=payload.decode("utf-8", errors="replace"),
+                payload_text=safe_payload_text,
                 output_text=json.dumps({"handled": True}),
             )
         if event_id:
