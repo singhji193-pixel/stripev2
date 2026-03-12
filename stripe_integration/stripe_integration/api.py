@@ -339,6 +339,26 @@ def refund_payment_stripe(invoice_name: str, gate_password: str = None, reason: 
 
     pi_id = inv.get("stripe_payment_intent_id")
     if not pi_id:
+        # Fallback: derive PI from latest submitted Payment Entry linked to this invoice.
+        refs = frappe.get_all(
+            "Payment Entry Reference",
+            filters={
+                "reference_doctype": "Sales Invoice",
+                "reference_name": invoice_name,
+                "parenttype": "Payment Entry",
+                "docstatus": ["!=", 2],
+            },
+            fields=["parent", "modified"],
+            order_by="modified desc",
+            limit_page_length=5,
+        )
+        for ref in refs:
+            pe_ref = frappe.db.get_value("Payment Entry", ref.get("parent"), ["reference_no", "docstatus"], as_dict=True)
+            if pe_ref and int(pe_ref.get("docstatus") or 0) == 1 and pe_ref.get("reference_no"):
+                pi_id = pe_ref.get("reference_no")
+                break
+
+    if not pi_id:
         frappe.throw("No Stripe payment intent found for this invoice")
 
     company = inv.get("company")
