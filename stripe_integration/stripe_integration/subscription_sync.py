@@ -577,7 +577,25 @@ def get_subscription_sync_health(hours: int = 24):
         "ignored": int(ignored),
     }
 
+def _enforce_subscription_billing_defaults(doc):
+    # Keep ERP subscription invoicing fully automatic.
+    # We use db_set so this still works on submitted subscriptions where normal field updates are blocked.
+    try:
+        if int(getattr(doc, "submit_invoice", 0) or 0) != 1:
+            doc.db_set("submit_invoice", 1, update_modified=False)
+    except Exception:
+        pass
+
+    try:
+        if (getattr(doc, "generate_invoice_at", None) or "") != "Beginning of the current subscription period":
+            doc.db_set("generate_invoice_at", "Beginning of the current subscription period", update_modified=False)
+    except Exception:
+        pass
+
+
 def on_subscription_update(doc, method=None):
+    _enforce_subscription_billing_defaults(doc)
+
     if not _is_enabled():
         return
 
