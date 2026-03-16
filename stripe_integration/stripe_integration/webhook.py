@@ -403,6 +403,18 @@ def _handle_checkout_session(session: dict):
 
     _create_payment_entry_for_sales_invoice(docname, pi_id, paid_amount, request_kind=request_kind)
 
+    # Deactivate the Payment Link so it cannot be paid again
+    payment_link_id = session.get("payment_link")
+    if payment_link_id:
+        try:
+            company_abbr = metadata.get("company_abbr")
+            if company_abbr:
+                from stripe_integration.stripe_integration.utils import get_api_key
+                stripe.api_key = get_api_key(company_abbr)
+            stripe.PaymentLink.modify(payment_link_id, active=False)
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), "Stripe: failed to deactivate Payment Link after payment")
+
 
 def _handle_subscription_setup_session(session: dict):
     metadata = session.get("metadata") or {}

@@ -276,7 +276,7 @@ def _compute_request_amount_and_kind(inv):
 
 
 def _create_payment_link(amount: float, currency_lc: str, invoice_name: str, company_abbr: str, metadata: dict):
-    """Fallback path if Checkout Session create/rendering is problematic."""
+    """Create a Stripe Payment Link for the given invoice. Does not expire. Deactivated via webhook after payment."""
 
     base_domain = "https://coengine.ai" if company_abbr == "COE" else "https://join.coreorbit.io"
     success_url = f"{base_domain}/payment-success?invoice={invoice_name}"
@@ -623,7 +623,7 @@ def refund_payment_stripe(invoice_name: str, gate_password: str = None, reason: 
 
 @frappe.whitelist()
 def request_payment_stripe(invoice_name: str, gate_password: str = None):
-    """Default: Stripe Checkout Session (hosted). Fallback: Stripe Payment Link.
+    """Primary: Stripe Payment Link (no expiry). Deactivated automatically after payment via webhook.
 
     Uses custom fields on Sales Invoice (Address & Contact -> Payment Configuration).
     """
@@ -652,58 +652,23 @@ def request_payment_stripe(invoice_name: str, gate_password: str = None):
     if not customer_email:
         frappe.throw("No customer email found on invoice/customer")
 
-    success_url = get_url() + "/api/method/stripe_integration.stripe_integration.api.payment_success?invoice=" + invoice_name
-    cancel_url = get_url() + "/api/method/stripe_integration.stripe_integration.api.payment_cancelled?invoice=" + invoice_name
-
     metadata = {
         "doctype": doctype,
         "docname": invoice_name,
         "company": company,
         "company_abbr": company_abbr,
         "site": frappe.local.site,
-        "source": "checkout_session",
+        "source": "payment_link",
         "request_kind": request_kind,
         "payment_split_type": inv.get("payment_split_type"),
         "initial_payment_percentage": inv.get("initial_payment_percentage"),
         "requested_amount": str(amount),
     }
 
-    checkout_url = None
-    session_id = None
-    mode_used = "checkout_session"
-
-    try:
-        session_params = {
-            "mode": "payment",
-            "payment_method_types": ["card"],
-            "line_items": [
-                {
-                    "price_data": {
-                        "currency": currency_lc,
-                        "product_data": {"name": f"Invoice {invoice_name}"},
-                        "unit_amount": int(round(amount * 100)),
-                    },
-                    "quantity": 1,
-                }
-            ],
-            "success_url": success_url,
-            "cancel_url": cancel_url,
-            "customer_email": customer_email,
-            "metadata": metadata,
-        }
-
-        session = stripe.checkout.Session.create(**session_params)
-        checkout_url = session.get("url")
-        session_id = session.get("id")
-    except Exception:
-        frappe.log_error(frappe.get_traceback(), "Stripe Checkout Session create failed; using Payment Link fallback")
-
-    if not checkout_url:
-        mode_used = "payment_link"
-        metadata["source"] = "payment_link_fallback"
-        link = _create_payment_link(amount, currency_lc, invoice_name, company_abbr, metadata)
-        checkout_url = link.url
-        session_id = link.id
+    link = _create_payment_link(amount, currency_lc, invoice_name, company_abbr, metadata)
+    checkout_url = link.url
+    session_id = link.id
+    mode_used = "payment_link"
 
     _safe_set_value(doctype, invoice_name, "stripe_checkout_url", checkout_url)
     _safe_set_value(doctype, invoice_name, "stripe_checkout_session_id", session_id)
