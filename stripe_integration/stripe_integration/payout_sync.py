@@ -14,7 +14,15 @@ def _is_enabled() -> bool:
 
 
 def _get_accounts_for_company_abbr(company_abbr: str):
-    acc = frappe.get_doc("Stripe Account", company_abbr)
+    abbr = (company_abbr or "").strip().upper()
+    if not abbr:
+        frappe.throw("Missing company abbr for payout account lookup")
+
+    name = frappe.db.get_value("Stripe Account", {"company_abbr": abbr, "enabled": 1}, "name")
+    if not name:
+        frappe.throw(f"Stripe account not configured for company abbr: {abbr}")
+
+    acc = frappe.get_doc("Stripe Account", name)
     return {
         "company": acc.company,
         "clearing": getattr(acc, "stripe_clearing_account", None),

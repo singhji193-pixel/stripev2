@@ -22,6 +22,7 @@ fixtures = [
         "filters": [["name", "in", [
             "Stripe CoreOrbit Add Payment Method",
             "Stripe CoreOrbit Subscription Started",
+            "Stripe CoreOrbit Subscription Resumed",
             "Stripe CoreOrbit Subscription Paused",
             "Stripe CoreOrbit Subscription Cancelled",
             "Stripe CoreOrbit Payment Request",

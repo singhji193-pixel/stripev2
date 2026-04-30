@@ -15,6 +15,7 @@ from stripe_integration.stripe_integration.refunds import apply_refund_to_erp
 
 STRIPE_ACTION_ROLES = ("System Manager", "Accounts Manager", "Accounts User")
 CREDIT_NOTE_REQUIRED_ERROR_CODE = "credit_note_required_before_refund"
+VALID_STRIPE_REFUND_REASONS = {"duplicate", "fraudulent", "requested_by_customer"}
 
 # Abuse-protection defaults (safe baseline; can be adjusted later if needed).
 REFUND_RATE_LIMIT_WINDOW_SECONDS = 60
@@ -533,6 +534,10 @@ def refund_payment_stripe(invoice_name: str, gate_password: str = None, reason: 
     _require_doc_permission(doctype, invoice_name, "write")
     _require_stripe_action_guard(gate_password, invoice_name=invoice_name)
     _enforce_refund_rate_limit(invoice_name)
+
+    reason = (reason or "requested_by_customer").strip()
+    if reason not in VALID_STRIPE_REFUND_REASONS:
+        frappe.throw(f"Invalid refund reason '{reason}'. Must be one of: {', '.join(sorted(VALID_STRIPE_REFUND_REASONS))}")
 
     inv = frappe.get_doc(doctype, invoice_name)
     if inv.docstatus != 1:

@@ -17,7 +17,7 @@ LIFECYCLE_TEMPLATE_MAP = {
     "COSL": {
         "add_payment_method": "Stripe CoreOrbit Add Payment Method",
         "started": "Stripe CoreOrbit Subscription Started",
-        "resumed": "Stripe CoreOrbit Subscription Started",
+        "resumed": "Stripe CoreOrbit Subscription Resumed",
         "paused": "Stripe CoreOrbit Subscription Paused",
         "cancelled": "Stripe CoreOrbit Subscription Cancelled",
     },
