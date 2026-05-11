@@ -11,6 +11,7 @@ from stripe_integration.stripe_integration.event_log import upsert_event, mark_e
 from stripe_integration.stripe_integration.subscription_payments import handle_invoice_paid
 from stripe_integration.stripe_integration.subscription_sync import (
     sync_subscription_from_webhook_event,
+    ensure_stripe_subscription_for_subscription,
     _set_subscription_fields,
     SETUP_STATUS_FIELD,
     SETUP_PM_FIELD,
@@ -368,13 +369,17 @@ def handle_webhook():
         if event_id:
             try:
                 mark_event_status(event_id, "Completed")
-                frappe.db.commit()
             except Exception:
                 frappe.log_error(frappe.get_traceback(), "Stripe Event Log update failed (Completed)")
         return {"status": "ok"}
     except Exception as e:
         if event_id:
             try:
+                # Roll back any uncommitted partial work from the failed handler
+                # before persisting the Failed status; already-committed records
+                # (e.g. a Payment Entry that committed before a later step failed)
+                # are unaffected since rollback only discards pending DML.
+                frappe.db.rollback()
                 mark_event_status(event_id, "Failed", str(e))
                 frappe.db.commit()
             except Exception:
@@ -395,12 +400,6 @@ def _handle_checkout_session(session: dict):
         return
 
     if doctype != "Sales Invoice" or not docname:
-        return
-
-    # For async payment methods, checkout.session.completed fires before payment
-    # is confirmed. Only create PE when payment_status is "paid".
-    payment_status = (session.get("payment_status") or "").strip().lower()
-    if payment_status and payment_status != "paid":
         return
 
     paid_amount = (session.get("amount_total", 0) or 0) / 100.0
@@ -477,6 +476,16 @@ def _handle_subscription_setup_session(session: dict):
             SETUP_INTENT_FIELD: setup_intent_id,
         },
     )
+
+    if not stripe_sub_id:
+        try:
+            ensure_stripe_subscription_for_subscription(
+                sub_name,
+                payment_method=payment_method,
+                stripe_customer_id=stripe_customer_id,
+            )
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), f"Auto-create Stripe subscription failed for {sub_name}")
 
 
 def _handle_refund_event(event: dict):
@@ -561,25 +570,17 @@ def _create_payment_entry_for_sales_invoice(sales_invoice_name: str, stripe_pi_i
             pe.insert(ignore_permissions=True)
             pe.submit()
 
+            _send_payment_receipt_email(invoice, pe, request_kind=request_kind)
+
             # For Split Payment workflow: mark that at least one Stripe payment was processed.
             # This makes the next "Request Payment (Stripe)" send the remaining balance.
             if frappe.get_meta("Sales Invoice").get_field("custom_stripe_payment_processed"):
                 frappe.db.set_value("Sales Invoice", invoice.name, "custom_stripe_payment_processed", 1, update_modified=False)
 
-            # Set stripe_payment_intent_id on PE for consistent refund lookup.
-            if frappe.get_meta("Payment Entry").get_field("stripe_payment_intent_id"):
-                frappe.db.set_value("Payment Entry", pe.name, "stripe_payment_intent_id", stripe_pi_id, update_modified=False)
-
             frappe.db.commit()
         except DuplicateEntryError:
             frappe.db.rollback()
             return
-
-        # Send receipt email AFTER commit so email failures never roll back the Payment Entry.
-        try:
-            _send_payment_receipt_email(invoice, pe, request_kind=request_kind)
-        except Exception:
-            frappe.log_error(frappe.get_traceback(), "Stripe: payment receipt email failed (PE already committed)")
 
 
 def _get_customer_email_from_invoice(invoice):
