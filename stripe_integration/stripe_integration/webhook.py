@@ -375,6 +375,11 @@ def handle_webhook():
     except Exception as e:
         if event_id:
             try:
+                # Roll back any uncommitted partial work from the failed handler
+                # before persisting the Failed status; already-committed records
+                # (e.g. a Payment Entry that committed before a later step failed)
+                # are unaffected since rollback only discards pending DML.
+                frappe.db.rollback()
                 mark_event_status(event_id, "Failed", str(e))
                 frappe.db.commit()
             except Exception:

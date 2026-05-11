@@ -31,8 +31,10 @@ def handle_invoice_paid(event: dict):
     if not si_name:
         return {"handled": False, "reason": "sales_invoice_not_found", "stripe_invoice_id": stripe_invoice_id}
 
-    # Use the PI or invoice ID as lock key to prevent concurrent duplicate creation.
-    lock_key = f"stripe_inv_paid_{stripe_pi_id or stripe_invoice_id}"
+    # Use the PI as lock key when present so we serialize against the parallel
+    # checkout.session.completed handler (which locks on `stripe_pi_{pi}` too).
+    # Fall back to invoice id for events without a PI.
+    lock_key = f"stripe_pi_{stripe_pi_id}" if stripe_pi_id else f"stripe_inv_{stripe_invoice_id}"
     if not _acquire_lock(lock_key, timeout=30):
         frappe.throw("Could not acquire Stripe invoice.paid lock", frappe.ValidationError)
 
