@@ -62,6 +62,7 @@ class WebhookAbuseProtectionTests(unittest.TestCase):
 
         fake_subscription_sync = types.ModuleType("stripe_integration.stripe_integration.subscription_sync")
         fake_subscription_sync.sync_subscription_from_webhook_event = lambda *_args, **_kwargs: None
+        fake_subscription_sync.ensure_stripe_subscription_for_subscription = lambda *_args, **_kwargs: None
         fake_subscription_sync._set_subscription_fields = lambda *_args, **_kwargs: None
         fake_subscription_sync.SETUP_STATUS_FIELD = "setup_status"
         fake_subscription_sync.SETUP_PM_FIELD = "setup_pm"

@@ -31,6 +31,7 @@ fixtures = [
             "Stripe CoreOrbit Add Payment Method",
             "Stripe CoreOrbit Subscription Started",
             "Stripe CoreOrbit Subscription Paused",
+            "Stripe CoreOrbit Subscription Resumed",
             "Stripe CoreOrbit Subscription Cancelled",
             "Stripe CoreOrbit Payment Request",
             "Stripe COEngine Add Payment Method",
