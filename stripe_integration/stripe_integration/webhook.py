@@ -570,17 +570,30 @@ def _create_payment_entry_for_sales_invoice(sales_invoice_name: str, stripe_pi_i
             pe.insert(ignore_permissions=True)
             pe.submit()
 
-            _send_payment_receipt_email(invoice, pe, request_kind=request_kind)
-
             # For Split Payment workflow: mark that at least one Stripe payment was processed.
             # This makes the next "Request Payment (Stripe)" send the remaining balance.
             if frappe.get_meta("Sales Invoice").get_field("custom_stripe_payment_processed"):
                 frappe.db.set_value("Sales Invoice", invoice.name, "custom_stripe_payment_processed", 1, update_modified=False)
 
+            # Populate stripe_payment_intent_id on the Payment Entry so refund
+            # events that look up by PI can locate the row. Without this, only
+            # legacy rows fixed by backfill_payment_entry_stripe_pi_id are
+            # findable; new PEs would fall through to manual matching.
+            if frappe.get_meta("Payment Entry").get_field("stripe_payment_intent_id"):
+                frappe.db.set_value("Payment Entry", pe.name, "stripe_payment_intent_id", stripe_pi_id, update_modified=False)
+
             frappe.db.commit()
         except DuplicateEntryError:
             frappe.db.rollback()
             return
+
+        # Receipt email runs AFTER the commit, wrapped, so an SMTP failure can
+        # never roll back the Payment Entry we just submitted. Logging is best
+        # effort; the customer-facing payment is what matters.
+        try:
+            _send_payment_receipt_email(invoice, pe, request_kind=request_kind)
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), "Stripe: payment receipt email failed (PE already committed)")
 
 
 def _get_customer_email_from_invoice(invoice):
