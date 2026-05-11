@@ -1,4 +1,31 @@
 frappe.ui.form.on("Sales Invoice", {
+  setup(frm) {
+    const companyFilter = () => ({ filters: { company: frm.doc.company || "" } });
+
+    frm.set_query("debit_to", companyFilter);
+    frm.set_query("cost_center", companyFilter);
+    frm.set_query("taxes_and_charges", () => ({
+      filters: {
+        company: frm.doc.company || "",
+        docstatus: ["<", 2]
+      }
+    }));
+
+    frm.set_query("income_account", "items", companyFilter);
+    frm.set_query("expense_account", "items", companyFilter);
+    frm.set_query("cost_center", "items", companyFilter);
+  },
+
+  company(frm) {
+    // Clear potentially cross-company selections when company changes.
+    ["debit_to", "cost_center", "taxes_and_charges"].forEach((f) => frm.set_value(f, null));
+    (frm.doc.items || []).forEach((row) => {
+      frappe.model.set_value(row.doctype, row.name, "income_account", null);
+      frappe.model.set_value(row.doctype, row.name, "expense_account", null);
+      frappe.model.set_value(row.doctype, row.name, "cost_center", null);
+    });
+  },
+
   refresh(frm) {
     // Keep print output brand-correct per company inside the ERP Print action.
     // Frappe stores this per-user as last_print_format for the doctype.
@@ -76,7 +103,10 @@ frappe.ui.form.on("Sales Invoice", {
       }, "Payments");
     }
 
-    const canRefund = !!frm.doc.stripe_payment_intent_id && (frm.doc.paid_amount || 0) > 0;
+    const hasStripeRef = !!(frm.doc.stripe_payment_intent_id || frm.doc.stripe_invoice_id);
+    const hasCollectedAmount = (frm.doc.status === "Paid" || frm.doc.status === "Partly Paid" || (frm.doc.grand_total || 0) > (frm.doc.outstanding_amount || 0));
+    const isNotReturn = frm.doc.status !== "Return";
+    const canRefund = hasStripeRef && hasCollectedAmount && isNotReturn;
     if (canRefund) {
       frm.add_custom_button("Refund Stripe Payment", () => {
         frappe.confirm(

@@ -1,8 +1,13 @@
 import json
+import base64
+import hashlib
+import hmac
+from datetime import datetime, time as dtime
+
 import frappe
 import stripe
 
-from frappe.utils import get_url
+from frappe.utils import get_url, getdate, nowdate
 from stripe_integration.stripe_integration.utils import get_company_abbr_from_company, get_api_key
 from stripe_integration.stripe_integration.event_log import upsert_event, mark_event_status
 
@@ -17,7 +22,7 @@ LIFECYCLE_TEMPLATE_MAP = {
     "COSL": {
         "add_payment_method": "Stripe CoreOrbit Add Payment Method",
         "started": "Stripe CoreOrbit Subscription Started",
-        "resumed": "Stripe CoreOrbit Subscription Resumed",
+        "resumed": "Stripe CoreOrbit Subscription Started",
         "paused": "Stripe CoreOrbit Subscription Paused",
         "cancelled": "Stripe CoreOrbit Subscription Cancelled",
     },
@@ -33,6 +38,61 @@ SETUP_EXPIRES_AT_FIELD = "stripe_setup_link_expires_at"
 SETUP_STATUS_FIELD = "stripe_setup_link_status"
 SETUP_PM_FIELD = "stripe_default_payment_method_id"
 SETUP_INTENT_FIELD = "stripe_last_setup_intent_id"
+
+STABLE_SETUP_ROUTE = "/api/method/stripe_integration.stripe_integration.subscription_sync.open_subscription_setup_link"
+
+def _stripe_get(obj, key, default=None):
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    try:
+        if hasattr(obj, key):
+            value = getattr(obj, key)
+            return default if value is None else value
+    except Exception:
+        pass
+    try:
+        value = obj[key]
+        return default if value is None else value
+    except Exception:
+        pass
+    try:
+        as_dict = obj.to_dict_recursive() if hasattr(obj, "to_dict_recursive") else obj.to_dict()
+        if isinstance(as_dict, dict):
+            value = as_dict.get(key, default)
+            return default if value is None else value
+    except Exception:
+        pass
+    return default
+
+
+def _stable_setup_secret():
+    return (getattr(frappe.local.conf, "encryption_key", None) or frappe.local.site or "stripe-subscription-setup").encode()
+
+
+def _make_subscription_setup_token(subscription_name: str) -> str:
+    payload = subscription_name.encode()
+    sig = hmac.new(_stable_setup_secret(), payload, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(sig).decode().rstrip("=")
+
+
+def _subscription_setup_token_valid(subscription_name: str, token: str | None) -> bool:
+    if not subscription_name or not token:
+        return False
+    expected = _make_subscription_setup_token(subscription_name)
+    return hmac.compare_digest(expected, str(token).strip())
+
+
+def _build_stable_subscription_setup_url(sub_doc) -> str:
+    token = _make_subscription_setup_token(sub_doc.name)
+    return f"{get_url()}{STABLE_SETUP_ROUTE}?subscription_name={sub_doc.name}&token={token}"
+
+
+def _get_company_letterhead(company: str | None) -> str | None:
+    if not company:
+        return None
+    return frappe.db.get_value("Company", company, "default_letter_head")
 
 
 def _is_enabled() -> bool:
@@ -200,6 +260,107 @@ def _set_subscription_fields(sub_name: str, values: dict):
         frappe.db.commit()
 
 
+def _build_stripe_subscription_create_params(sub_doc, stripe_customer_id: str, payment_method: str, company_abbr: str):
+    plans = sub_doc.get("plans") or []
+    items = []
+    for row in plans:
+        plan = row.get("plan") if hasattr(row, "get") else getattr(row, "plan", None)
+        qty = row.get("qty") if hasattr(row, "get") else getattr(row, "qty", None)
+        if not plan:
+            continue
+        price_id = frappe.db.get_value("Subscription Plan", plan, "product_price_id")
+        if not price_id:
+            frappe.throw(f"Subscription Plan {plan} is missing Stripe product_price_id")
+        item = {"price": price_id}
+        if qty:
+            item["quantity"] = int(qty)
+        items.append(item)
+
+    if not items:
+        frappe.throw(f"Subscription {sub_doc.name} has no billable plans configured")
+
+    params = {
+        "customer": stripe_customer_id,
+        "items": items,
+        "default_payment_method": payment_method,
+        "collection_method": "charge_automatically",
+        "metadata": {
+            "doctype": "Subscription",
+            "docname": sub_doc.name,
+            "company": sub_doc.get("company") or "",
+            "company_abbr": company_abbr,
+            "site": frappe.local.site,
+            "source": "subscription_setup_completion",
+        },
+        "payment_settings": {"save_default_payment_method": "on_subscription"},
+    }
+
+    start_date = getdate(sub_doc.get("start_date")) if sub_doc.get("start_date") else None
+    today = getdate(nowdate())
+    if start_date and start_date > today:
+        params["trial_end"] = int(datetime.combine(start_date, dtime.min).timestamp())
+
+    return params
+
+
+def ensure_stripe_subscription_for_subscription(subscription_name: str, payment_method: str | None = None, stripe_customer_id: str | None = None):
+    sub_doc = frappe.get_doc("Subscription", subscription_name)
+    if sub_doc.get("stripe_subscription_id"):
+        return {"created": False, "reason": "already_linked", "stripe_subscription_id": sub_doc.get("stripe_subscription_id")}
+
+    company_abbr = _set_api_key_for_company(sub_doc.company)
+    payment_method = payment_method or sub_doc.get(SETUP_PM_FIELD)
+    if not payment_method:
+        return {"created": False, "reason": "missing_payment_method"}
+
+    customer_email = _resolve_subscription_email(sub_doc)
+    stripe_customer_id = stripe_customer_id or None
+    if not stripe_customer_id:
+        try:
+            existing = stripe.Customer.list(email=customer_email, limit=1).data if customer_email else []
+        except Exception:
+            existing = []
+        if existing:
+            stripe_customer_id = existing[0].id
+
+    if not stripe_customer_id:
+        customer_kwargs = {"name": sub_doc.get("party") or sub_doc.name}
+        if customer_email:
+            customer_kwargs["email"] = customer_email
+        customer_kwargs["metadata"] = {"doctype": "Subscription", "docname": sub_doc.name, "company_abbr": company_abbr}
+        stripe_customer_id = stripe.Customer.create(**customer_kwargs).id
+
+    try:
+        stripe.PaymentMethod.attach(payment_method, customer=stripe_customer_id)
+    except Exception:
+        pass
+
+    try:
+        stripe.Customer.modify(stripe_customer_id, invoice_settings={"default_payment_method": payment_method})
+    except Exception:
+        pass
+
+    params = _build_stripe_subscription_create_params(sub_doc, stripe_customer_id, payment_method, company_abbr)
+    remote_sub = stripe.Subscription.create(**params)
+
+    _set_subscription_fields(
+        sub_doc.name,
+        {
+            "stripe_subscription_id": _stripe_get(remote_sub, "id") or "",
+            "stripe_status": _stripe_get(remote_sub, "status") or "",
+            "stripe_paused": 1 if bool(_stripe_get(remote_sub, "pause_collection")) else 0,
+        },
+    )
+
+    return {
+        "created": True,
+        "subscription": sub_doc.name,
+        "stripe_subscription_id": _stripe_get(remote_sub, "id"),
+        "stripe_status": _stripe_get(remote_sub, "status"),
+        "trial_end": params.get("trial_end"),
+    }
+
+
 def _generate_subscription_setup_checkout_url(sub_doc, company_abbr: str, to_email: str | None = None):
     # Create a fresh setup-mode Checkout Session so customer adds a payment method
     # without immediate charge. This avoids stale/expired one-time payment links.
@@ -271,21 +432,64 @@ def _generate_subscription_setup_checkout_url(sub_doc, company_abbr: str, to_ema
 
 
 def _build_subscription_invoice_attachment(sub_doc):
+    """Build Sales Invoice PDF attachment ONLY from this subscription's invoices.
+
+    Avoids customer-wide fallback so wrong invoice never gets attached.
+    Returns: (pdf_attachment_or_none, invoice_name_or_none)
+    """
+    si_name = None
     try:
+        # Primary: latest submitted invoice tied to this subscription
+        # (attach even if paid; user expects invoice PDF on add-payment-method email)
         si_name = frappe.db.get_value(
             "Sales Invoice",
             {"subscription": sub_doc.name, "docstatus": 1},
             "name",
             order_by="posting_date desc, posting_time desc, modified desc",
         )
+
+        # Fallback: latest invoice tied to this subscription (any docstatus)
         if not si_name:
-            return None
+            si_name = frappe.db.get_value(
+                "Sales Invoice",
+                {"subscription": sub_doc.name},
+                "name",
+                order_by="posting_date desc, posting_time desc, modified desc",
+            )
+
+        if not si_name:
+            return None, None
 
         company_abbr = get_company_abbr_from_company(sub_doc.get("company"))
         pf = "CoreOrbit Beautiful Invoice" if company_abbr == "COSL" else "COEngine Beautiful Invoice"
-        return frappe.attach_print("Sales Invoice", si_name, file_name=f"{si_name}.pdf", print_format=pf)
+
+        letterhead = _get_company_letterhead(sub_doc.get("company"))
+        try:
+            # Preferred branded format
+            return frappe.attach_print(
+                "Sales Invoice",
+                si_name,
+                file_name=f"{si_name}.pdf",
+                print_format=pf,
+                letterhead=letterhead,
+            ), si_name
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), f"Attach print failed with forced format {pf} for {si_name}")
+            try:
+                # Safe fallback: Standard + company letterhead (avoids no-attachment outcome)
+                return frappe.attach_print(
+                    "Sales Invoice",
+                    si_name,
+                    file_name=f"{si_name}.pdf",
+                    print_format="Standard",
+                    letterhead=letterhead,
+                ), si_name
+            except Exception:
+                frappe.log_error(frappe.get_traceback(), f"Attach print failed with Standard fallback for {si_name}")
+                return None, si_name
     except Exception:
-        return None
+        frappe.log_error(frappe.get_traceback(), f"Build subscription invoice attachment failed for {sub_doc.name}")
+        return None, None
 
 
 def _send_lifecycle_email(subscription_name: str, company_abbr: str, kind: str, stripe_sub_obj: dict):
@@ -315,9 +519,10 @@ def _send_lifecycle_email(subscription_name: str, company_abbr: str, kind: str, 
 
     checkout_url = sub_doc.get(SETUP_URL_FIELD) or sub_doc.get("stripe_checkout_url") or ""
     if kind == "add_payment_method":
-        checkout_url = _generate_subscription_setup_checkout_url(sub_doc, company_abbr, to_email=to_email)
-        if not checkout_url:
+        raw_checkout_url = _generate_subscription_setup_checkout_url(sub_doc, company_abbr, to_email=to_email)
+        if not raw_checkout_url:
             return {"sent": False, "reason": "setup_checkout_url_missing", "template": template_name}
+        checkout_url = _build_stable_subscription_setup_url(sub_doc)
 
     args = {
         "subscription_name": sub_doc.name,
@@ -337,8 +542,9 @@ def _send_lifecycle_email(subscription_name: str, company_abbr: str, kind: str, 
 
     sender_cfg = _resolve_sender(company_abbr)
     attachments = []
+    attached_invoice = None
     if kind == "add_payment_method":
-        inv_pdf = _build_subscription_invoice_attachment(sub_doc)
+        inv_pdf, attached_invoice = _build_subscription_invoice_attachment(sub_doc)
         if inv_pdf:
             attachments.append(inv_pdf)
 
@@ -354,7 +560,14 @@ def _send_lifecycle_email(subscription_name: str, company_abbr: str, kind: str, 
         reference_doctype="Subscription",
         reference_name=sub_doc.name,
     )
-    return {"sent": True, "template": template_name, "to": to_email, "kind": kind}
+    return {
+        "sent": True,
+        "template": template_name,
+        "to": to_email,
+        "kind": kind,
+        "has_attachment": bool(attachments),
+        "attached_invoice": attached_invoice,
+    }
 
 
 def _apply_subscription_state(sub_name: str, stripe_sub_obj: dict):
@@ -614,3 +827,20 @@ def on_subscription_update(doc, method=None):
             frappe.db.set_value("Subscription", doc.name, "stripe_sync_action", "", update_modified=False)
         except Exception:
             pass
+
+
+@frappe.whitelist(allow_guest=True)
+def open_subscription_setup_link(subscription_name: str, token: str | None = None):
+    if not _subscription_setup_token_valid(subscription_name, token):
+        frappe.throw("Invalid or missing subscription setup token", frappe.PermissionError)
+
+    sub = frappe.get_doc("Subscription", subscription_name)
+    company_abbr = _set_api_key_for_company(sub.company)
+    to_email = _resolve_subscription_email(sub)
+    checkout_url = _generate_subscription_setup_checkout_url(sub, company_abbr, to_email=to_email)
+    if not checkout_url:
+        frappe.throw("Unable to generate a fresh Stripe setup link")
+
+    frappe.local.response["type"] = "redirect"
+    frappe.local.response["location"] = checkout_url
+    return

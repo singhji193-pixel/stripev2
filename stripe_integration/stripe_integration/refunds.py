@@ -2,15 +2,23 @@ import frappe
 from frappe.utils import flt
 
 
-def _find_matching_payment_entry(stripe_payment_intent_id: str):
-    if not stripe_payment_intent_id:
+def _find_matching_payment_entry(stripe_ref_id: str):
+    """Find Payment Entry by PI, invoice ID, or charge ID.
+    
+    Supports multiple Stripe reference types for maximum linkage success:
+    - Payment Intent ID (pi_xxx)
+    - Stripe Invoice ID (in_xxx) 
+    - Charge ID (ch_xxx)
+    """
+    if not stripe_ref_id:
         return None
 
+    # Path 1: Direct field lookup (custom field stripe_payment_intent_id)
     pe_name = frappe.db.get_value(
         "Payment Entry",
         {
             "docstatus": 1,
-            "stripe_payment_intent_id": stripe_payment_intent_id,
+            "stripe_payment_intent_id": stripe_ref_id,
         },
         "name",
         order_by="modified desc",
@@ -18,11 +26,12 @@ def _find_matching_payment_entry(stripe_payment_intent_id: str):
     if pe_name:
         return frappe.get_doc("Payment Entry", pe_name)
 
+    # Path 2: reference_no field (stores PI or invoice ID)
     pe_name = frappe.db.get_value(
         "Payment Entry",
         {
             "docstatus": 1,
-            "reference_no": stripe_payment_intent_id,
+            "reference_no": stripe_ref_id,
         },
         "name",
         order_by="modified desc",
@@ -30,6 +39,28 @@ def _find_matching_payment_entry(stripe_payment_intent_id: str):
     if pe_name:
         return frappe.get_doc("Payment Entry", pe_name)
 
+    return None
+
+
+def _find_payment_entry_by_invoice(invoice_name: str):
+    """Find the latest submitted Payment Entry allocated to a Sales Invoice."""
+    if not invoice_name:
+        return None
+
+    refs = frappe.get_all(
+        "Payment Entry Reference",
+        filters={
+            "reference_doctype": "Sales Invoice",
+            "reference_name": invoice_name,
+            "parenttype": "Payment Entry",
+            "docstatus": 1,
+        },
+        fields=["parent"],
+        order_by="modified desc",
+        limit_page_length=1,
+    )
+    if refs:
+        return frappe.get_doc("Payment Entry", refs[0].get("parent"))
     return None
 
 
@@ -113,6 +144,7 @@ def apply_refund_to_erp(
     refund_amount: float,
     currency: str,
     source: str = "webhook.refund",
+    invoice_name: str = None,
 ):
     """Link Stripe refund into ERP records.
 
@@ -120,31 +152,46 @@ def apply_refund_to_erp(
     - Full refund => cancel matching submitted Payment Entry
     - Partial refund => try credit-note allocation via refund Payment Entry
       and fallback to manual adjustment comment when allocation is not possible.
+    
+    Args:
+        stripe_payment_intent_id: PI, invoice ID, or charge ID to match PE
+        stripe_refund_id: Stripe refund object ID
+        refund_amount: Amount refunded
+        currency: Currency code
+        source: Source identifier for logging
+        invoice_name: Optional Sales Invoice name for fallback PE lookup
     """
 
     refund_amount = flt(refund_amount)
     if refund_amount <= 0:
         return {"handled": False, "reason": "non_positive_refund_amount"}
 
+    # Try multiple paths to find the Payment Entry
     pe = _find_matching_payment_entry(stripe_payment_intent_id)
+    
+    # Fallback: find PE by invoice if direct lookup failed
+    if not pe and invoice_name:
+        pe = _find_payment_entry_by_invoice(invoice_name)
+    
     if not pe:
         return {
             "handled": False,
             "reason": "payment_entry_not_found",
             "stripe_payment_intent_id": stripe_payment_intent_id,
+            "invoice_name": invoice_name,
         }
 
     paid_amount = flt(pe.paid_amount or pe.received_amount or 0)
-    invoice_name = None
+    resolved_invoice_name = invoice_name
     if pe.references:
         for ref in pe.references:
             if ref.reference_doctype == "Sales Invoice" and ref.reference_name:
-                invoice_name = ref.reference_name
+                resolved_invoice_name = ref.reference_name
                 break
 
     epsilon = 0.01
     if refund_amount + epsilon < paid_amount:
-        credit_note_name = _find_submitted_credit_note(invoice_name)
+        credit_note_name = _find_submitted_credit_note(resolved_invoice_name)
         if credit_note_name:
             refund_pe_name = _create_refund_payment_entry(
                 credit_note_name=credit_note_name,
@@ -154,7 +201,7 @@ def apply_refund_to_erp(
             )
             if refund_pe_name:
                 _comment_on_invoice(
-                    invoice_name,
+                    resolved_invoice_name,
                     (
                         f"Stripe partial refund auto-linked ({currency} {refund_amount:.2f}, "
                         f"refund {stripe_refund_id}, source {source}) for PI {stripe_payment_intent_id}. "
@@ -167,14 +214,14 @@ def apply_refund_to_erp(
                     "mode": "partial_refund_credit_note_allocated",
                     "payment_entry": pe.name,
                     "refund_payment_entry": refund_pe_name,
-                    "invoice": invoice_name,
+                    "invoice": resolved_invoice_name,
                     "credit_note": credit_note_name,
                     "refund_amount": refund_amount,
                     "paid_amount": paid_amount,
                 }
 
         _comment_on_invoice(
-            invoice_name,
+            resolved_invoice_name,
             (
                 f"Stripe partial refund received ({currency} {refund_amount:.2f}, "
                 f"refund {stripe_refund_id}, source {source}) for PI {stripe_payment_intent_id}. "
@@ -185,7 +232,7 @@ def apply_refund_to_erp(
             "handled": True,
             "mode": "partial_refund_manual_adjustment_required",
             "payment_entry": pe.name,
-            "invoice": invoice_name,
+            "invoice": resolved_invoice_name,
             "credit_note": credit_note_name,
             "refund_amount": refund_amount,
             "paid_amount": paid_amount,
@@ -195,7 +242,7 @@ def apply_refund_to_erp(
         pe.cancel()
 
     _comment_on_invoice(
-        invoice_name,
+        resolved_invoice_name,
         (
             f"Stripe refund applied: {currency} {refund_amount:.2f} (refund {stripe_refund_id}, "
             f"source {source}) for PI {stripe_payment_intent_id}. "
@@ -209,7 +256,7 @@ def apply_refund_to_erp(
         "handled": True,
         "mode": "full_refund_cancel_payment_entry",
         "payment_entry": pe.name,
-        "invoice": invoice_name,
+        "invoice": resolved_invoice_name,
         "refund_amount": refund_amount,
         "paid_amount": paid_amount,
     }

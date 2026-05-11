@@ -3,6 +3,31 @@ import time
 import frappe
 import stripe
 
+def _stripe_get(obj, key, default=None):
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    try:
+        if hasattr(obj, key):
+            value = getattr(obj, key)
+            return default if value is None else value
+    except Exception:
+        pass
+    try:
+        value = obj[key]
+        return default if value is None else value
+    except Exception:
+        pass
+    try:
+        as_dict = obj.to_dict_recursive() if hasattr(obj, "to_dict_recursive") else obj.to_dict()
+        if isinstance(as_dict, dict):
+            value = as_dict.get(key, default)
+            return default if value is None else value
+    except Exception:
+        pass
+    return default
+
 from frappe.utils import flt, get_url, now, fmt_money
 from frappe.utils.password import check_password
 
@@ -15,7 +40,6 @@ from stripe_integration.stripe_integration.refunds import apply_refund_to_erp
 
 STRIPE_ACTION_ROLES = ("System Manager", "Accounts Manager", "Accounts User")
 CREDIT_NOTE_REQUIRED_ERROR_CODE = "credit_note_required_before_refund"
-VALID_STRIPE_REFUND_REASONS = {"duplicate", "fraudulent", "requested_by_customer"}
 
 # Abuse-protection defaults (safe baseline; can be adjusted later if needed).
 REFUND_RATE_LIMIT_WINDOW_SECONDS = 60
@@ -535,10 +559,6 @@ def refund_payment_stripe(invoice_name: str, gate_password: str = None, reason: 
     _require_stripe_action_guard(gate_password, invoice_name=invoice_name)
     _enforce_refund_rate_limit(invoice_name)
 
-    reason = (reason or "requested_by_customer").strip()
-    if reason not in VALID_STRIPE_REFUND_REASONS:
-        frappe.throw(f"Invalid refund reason '{reason}'. Must be one of: {', '.join(sorted(VALID_STRIPE_REFUND_REASONS))}")
-
     inv = frappe.get_doc(doctype, invoice_name)
     if inv.docstatus != 1:
         frappe.throw("Invoice must be Submitted before refunding")
@@ -577,8 +597,8 @@ def refund_payment_stripe(invoice_name: str, gate_password: str = None, reason: 
     stripe.api_key = get_api_key(company_abbr)
 
     payment = stripe.PaymentIntent.retrieve(pi_id)
-    amount_received = float((payment.get("amount_received") or 0) / 100.0)
-    currency = (payment.get("currency") or inv.get("currency") or "CAD").upper()
+    amount_received = float((_stripe_get(payment, "amount_received") or 0) / 100.0)
+    currency = (_stripe_get(payment, "currency") or inv.get("currency") or "CAD").upper()
 
     if amount_received <= 0:
         frappe.throw("Stripe payment has no received amount to refund")
@@ -602,10 +622,10 @@ def refund_payment_stripe(invoice_name: str, gate_password: str = None, reason: 
         "ok": True,
         "invoice": invoice_name,
         "payment_intent": pi_id,
-        "refund_id": refund.get("id"),
-        "refund_status": refund.get("status"),
-        "amount": float((refund.get("amount") or 0) / 100.0),
-        "currency": (refund.get("currency") or currency).upper(),
+        "refund_id": _stripe_get(refund, "id"),
+        "refund_status": _stripe_get(refund, "status"),
+        "amount": float((_stripe_get(refund, "amount") or 0) / 100.0),
+        "currency": (_stripe_get(refund, "currency") or currency).upper(),
     }
 
     linked = apply_refund_to_erp(

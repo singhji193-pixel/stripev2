@@ -14,7 +14,15 @@ doctype_js = {
 
 doc_events = {}
 
-doc_events.update({"Subscription": {"on_update": "stripe_integration.stripe_integration.subscription_sync.on_subscription_update"}})
+doc_events.update({
+    "Subscription": {
+        "validate": "stripe_integration.stripe_integration.company_guard.validate_subscription_company_scope",
+        "on_update": "stripe_integration.stripe_integration.subscription_sync.on_subscription_update",
+    },
+    "Sales Invoice": {
+        "validate": "stripe_integration.stripe_integration.company_guard.validate_sales_invoice_company_scope",
+    },
+})
 
 fixtures = [
     {
@@ -22,7 +30,6 @@ fixtures = [
         "filters": [["name", "in", [
             "Stripe CoreOrbit Add Payment Method",
             "Stripe CoreOrbit Subscription Started",
-            "Stripe CoreOrbit Subscription Resumed",
             "Stripe CoreOrbit Subscription Paused",
             "Stripe CoreOrbit Subscription Cancelled",
             "Stripe CoreOrbit Payment Request",
