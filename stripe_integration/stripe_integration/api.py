@@ -228,43 +228,11 @@ def _get_recipient_email(doc):
         if getattr(doc, fn, None):
             return getattr(doc, fn)
 
-    customer = getattr(doc, "customer", None) or doc.get("customer")
-    if not customer:
-        return None
-
-    # 2. Customer.email_id (rare in modern ERPNext but still supported).
-    email = frappe.db.get_value("Customer", customer, "email_id")
-    if email:
-        return email
-
-    # 3. Customer's primary contact (Customer.customer_primary_contact -> Contact).
-    primary_contact = frappe.db.get_value("Customer", customer, "customer_primary_contact")
-    if primary_contact:
-        email = frappe.db.get_value("Contact", primary_contact, "email_id")
-        if email:
-            return email
-
-    # 4. Fallback: any Contact linked to the Customer via Dynamic Link. This is
-    #    where modern ERPNext stores customer emails by default. Prefer the
-    #    primary email row, then the primary contact, then the oldest contact.
-    rows = frappe.db.sql(
-        """
-        SELECT ce.email_id
-        FROM `tabContact Email` ce
-        JOIN `tabContact` c ON c.name = ce.parent
-        JOIN `tabDynamic Link` dl ON dl.parent = c.name
-        WHERE dl.link_doctype = 'Customer'
-          AND dl.link_name = %s
-          AND ce.email_id IS NOT NULL
-          AND ce.email_id != ''
-        ORDER BY ce.is_primary DESC, c.is_primary_contact DESC, c.creation ASC
-        LIMIT 1
-        """,
-        (customer,),
-    )
-    if rows:
-        return rows[0][0]
-    return None
+    # 2-4. Walk Customer -> primary contact -> linked Contacts. Shared logic
+    # lives in utils.resolve_customer_email so the subscription flow uses
+    # the same resolution order.
+    from stripe_integration.stripe_integration.utils import resolve_customer_email
+    return resolve_customer_email(getattr(doc, "customer", None) or doc.get("customer"))
 
 
 def _safe_set_value(doctype, name, fieldname, value):

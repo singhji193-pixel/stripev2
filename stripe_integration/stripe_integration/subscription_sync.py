@@ -209,18 +209,21 @@ def _map_stripe_to_erp_status(stripe_status: str | None, paused: bool = False):
 
 
 def _resolve_subscription_email(sub_doc):
+    # 1. Direct fields on the Subscription doc.
     for fn in ("contact_email", "email", "subscriber_email", "customer_email"):
         v = sub_doc.get(fn)
         if v:
             return v
 
+    # 2-4. Walk the linked Customer via the shared resolver (Customer.email_id,
+    # customer_primary_contact, then linked Contact via Dynamic Link).
     party_type = (sub_doc.get("party_type") or "").strip()
     party = sub_doc.get("party")
-    if party_type == "Customer" and party:
-        email = frappe.db.get_value("Customer", party, "email_id")
-        if email:
-            return email
-    return None
+    if party_type != "Customer" or not party:
+        return None
+
+    from stripe_integration.stripe_integration.utils import resolve_customer_email
+    return resolve_customer_email(party)
 
 
 def _pick_lifecycle_kind(prev_status: str | None, prev_paused: bool, new_status: str | None, new_paused: bool):
