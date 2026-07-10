@@ -4,6 +4,8 @@ import types
 import unittest
 from unittest.mock import Mock
 
+from module_isolation import restore_modules
+
 
 class _JournalEntry:
     def __init__(self):
@@ -63,8 +65,7 @@ class PayoutAccountingTests(unittest.TestCase):
         self.module = importlib.import_module("stripe_integration.stripe_integration.payout_sync")
 
     def tearDown(self):
-        sys.modules.clear()
-        sys.modules.update(self._orig_modules)
+        restore_modules(self._orig_modules)
 
     def test_payout_created_does_not_post_a_journal_entry(self):
         self.module._make_journal_entry = Mock(return_value="JV-TEST-0001")

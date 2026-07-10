@@ -3,6 +3,8 @@ import sys
 import types
 import unittest
 
+from module_isolation import restore_modules
+
 
 class _FakeCache:
     def __init__(self):
@@ -86,8 +88,7 @@ class WebhookAbuseProtectionTests(unittest.TestCase):
         self.frappe = fake_frappe
 
     def tearDown(self):
-        sys.modules.clear()
-        sys.modules.update(self._orig_modules)
+        restore_modules(self._orig_modules)
 
     def test_webhook_blocks_large_payload(self):
         payload = b"x" * (self.webhook.WEBHOOK_MAX_PAYLOAD_BYTES + 1)

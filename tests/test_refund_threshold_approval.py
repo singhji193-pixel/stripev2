@@ -3,6 +3,8 @@ import sys
 import types
 import unittest
 
+from module_isolation import restore_modules
+
 
 class RefundThresholdApprovalTests(unittest.TestCase):
     def setUp(self):
@@ -54,8 +56,7 @@ class RefundThresholdApprovalTests(unittest.TestCase):
         self.frappe = fake_frappe
 
     def tearDown(self):
-        sys.modules.clear()
-        sys.modules.update(self._orig_modules)
+        restore_modules(self._orig_modules)
 
     def test_threshold_disabled_allows_non_system_manager(self):
         self.frappe.db.get_single_value = lambda *args, **kwargs: 0

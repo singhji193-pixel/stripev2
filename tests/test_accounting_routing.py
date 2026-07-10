@@ -4,6 +4,8 @@ import types
 import unittest
 from unittest.mock import Mock
 
+from module_isolation import restore_modules
+
 
 class _Obj(dict):
     def __getattr__(self, key):
@@ -53,8 +55,7 @@ class AccountingRoutingTests(unittest.TestCase):
         self.accounting = importlib.import_module("stripe_integration.stripe_integration.accounting")
 
     def tearDown(self):
-        sys.modules.clear()
-        sys.modules.update(self._orig_modules)
+        restore_modules(self._orig_modules)
 
     @staticmethod
     def payment_entry(payment_type):

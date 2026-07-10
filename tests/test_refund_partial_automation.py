@@ -4,6 +4,8 @@ import types
 import unittest
 from unittest.mock import Mock
 
+from module_isolation import restore_modules
+
 
 class _Obj(dict):
     def __getattr__(self, item):
@@ -90,8 +92,7 @@ class RefundPartialAutomationTests(unittest.TestCase):
         self.get_payment_entry = payment_entry_mod.get_payment_entry
 
     def tearDown(self):
-        sys.modules.clear()
-        sys.modules.update(self._orig_modules)
+        restore_modules(self._orig_modules)
 
     def test_partial_refund_auto_allocates_to_credit_note(self):
         self.frappe.db.get_value.side_effect = ["PE-ORIG", "CAD", "CN-0001", -40.0, "CAD"]

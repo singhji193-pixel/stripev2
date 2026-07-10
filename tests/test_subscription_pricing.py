@@ -5,6 +5,8 @@ import unittest
 from datetime import date, timedelta, timezone
 from unittest.mock import Mock
 
+from module_isolation import restore_modules
+
 
 class _Obj(dict):
     def __getattr__(self, key):
@@ -88,8 +90,7 @@ class SubscriptionPricingTests(unittest.TestCase):
         self.module.ZoneInfo = lambda name: timezone(timedelta(hours=-7))
 
     def tearDown(self):
-        sys.modules.clear()
-        sys.modules.update(self._orig_modules)
+        restore_modules(self._orig_modules)
 
     @staticmethod
     def subscription():

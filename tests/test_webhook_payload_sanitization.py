@@ -4,6 +4,8 @@ import sys
 import types
 import unittest
 
+from module_isolation import restore_modules
+
 
 class WebhookPayloadSanitizationTests(unittest.TestCase):
     def setUp(self):
@@ -57,8 +59,7 @@ class WebhookPayloadSanitizationTests(unittest.TestCase):
         self.webhook = importlib.import_module("stripe_integration.stripe_integration.webhook")
 
     def tearDown(self):
-        sys.modules.clear()
-        sys.modules.update(self._orig_modules)
+        restore_modules(self._orig_modules)
 
     def test_build_safe_payload_text_redacts_pii_and_masks_ids(self):
         raw_event = {

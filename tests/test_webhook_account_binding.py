@@ -5,6 +5,8 @@ import types
 import unittest
 from unittest.mock import Mock
 
+from module_isolation import restore_modules
+
 
 class WebhookAccountBindingTests(unittest.TestCase):
     def setUp(self):
@@ -90,8 +92,7 @@ class WebhookAccountBindingTests(unittest.TestCase):
         self.webhook = importlib.import_module("stripe_integration.stripe_integration.webhook")
 
     def tearDown(self):
-        sys.modules.clear()
-        sys.modules.update(self._orig_modules)
+        restore_modules(self._orig_modules)
 
     def test_extract_claimed_company_abbr_from_company_name(self):
         event = {

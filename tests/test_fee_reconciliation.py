@@ -4,6 +4,8 @@ import types
 import unittest
 from unittest.mock import Mock
 
+from module_isolation import restore_modules
+
 
 class FeeReconciliationTests(unittest.TestCase):
     def setUp(self):
@@ -56,8 +58,7 @@ class FeeReconciliationTests(unittest.TestCase):
         )
 
     def tearDown(self):
-        sys.modules.clear()
-        sys.modules.update(self._orig_modules)
+        restore_modules(self._orig_modules)
 
     def test_historical_cash_receipt_is_not_auto_posted_to_clearing(self):
         result = self.module.audit_unposted_fee_entries("COE")
