@@ -2,11 +2,15 @@ from datetime import datetime, timedelta, timezone
 
 import frappe
 import stripe
+from frappe.utils import flt, nowdate
 
-from frappe.utils import flt, getdate, nowdate
-
-from stripe_integration.stripe_integration.utils import get_api_key, get_company_abbr_from_company
+from stripe_integration.stripe_integration.accounting import (
+    MariaDBNamedLock,
+    prepare_stripe_receipt_payment_entry,
+    stripe_timestamp_date,
+)
 from stripe_integration.stripe_integration.stripe_fees import ensure_fee_posted
+from stripe_integration.stripe_integration.utils import get_api_key, get_company_abbr_from_company
 
 
 def _stripe_get(obj, key, default=None):
@@ -15,14 +19,15 @@ def _stripe_get(obj, key, default=None):
     if isinstance(obj, dict):
         return obj.get(key, default)
     try:
-        if hasattr(obj, key):
-            value = getattr(obj, key)
-            return default if value is None else value
+        value = obj[key]
+        return default if value is None else value
     except Exception:
         pass
     try:
-        value = obj[key]
-        return default if value is None else value
+        if hasattr(obj, key):
+            value = getattr(obj, key)
+            if not callable(value):
+                return default if value is None else value
     except Exception:
         pass
     try:
@@ -50,7 +55,7 @@ def _invoice_subscription_id(obj: dict) -> str | None:
 
 def _resolve_payment_intent_from_stripe_invoice(stripe_invoice_id: str, company_abbr: str | None = None) -> str | None:
     """Fetch Payment Intent ID from Stripe Invoice when not directly available.
-    
+
     For subscription payments, the invoice.paid event may have payment_intent=None
     because the charge was created via Stripe Invoice, not direct PaymentIntent.
     This fetches the underlying PI for proper linkage.
@@ -59,14 +64,19 @@ def _resolve_payment_intent_from_stripe_invoice(stripe_invoice_id: str, company_
         return None
 
     try:
+        api_key = None
         if company_abbr:
-            stripe.api_key = get_api_key(company_abbr)
-        
+            api_key = get_api_key(company_abbr)
+
         # Basil API versions moved invoice payments out of the legacy
         # invoice.payment_intent / invoice.charge fields.
         invoice_payment_api = getattr(stripe, "InvoicePayment", None)
         if invoice_payment_api:
-            invoice_payments = invoice_payment_api.list(invoice=stripe_invoice_id, limit=100)
+            invoice_payments = invoice_payment_api.list(
+                invoice=stripe_invoice_id,
+                limit=100,
+                api_key=api_key,
+            )
             for invoice_payment in _stripe_get(invoice_payments, "data") or []:
                 if _stripe_get(invoice_payment, "status") != "paid":
                     continue
@@ -75,19 +85,19 @@ def _resolve_payment_intent_from_stripe_invoice(stripe_invoice_id: str, company_
                 if pi_id:
                     return pi_id
 
-        inv = stripe.Invoice.retrieve(stripe_invoice_id)
+        inv = stripe.Invoice.retrieve(stripe_invoice_id, api_key=api_key)
         pi_id = _stripe_get(inv, "payment_intent")
         if pi_id:
             return pi_id
-        
+
         # Fallback: get charge and resolve PI from there
         charge_id = _stripe_get(inv, "charge") or _stripe_get(inv, "latest_charge")
         if charge_id:
-            charge = stripe.Charge.retrieve(charge_id)
+            charge = stripe.Charge.retrieve(charge_id, api_key=api_key)
             return _stripe_get(charge, "payment_intent")
     except Exception:
         frappe.log_error(frappe.get_traceback(), "Resolve PI from Stripe Invoice failed")
-    
+
     return None
 
 
@@ -199,10 +209,8 @@ def handle_invoice_paid(event: dict):
     if not si_name:
         return {"handled": False, "reason": "sales_invoice_not_found", "stripe_invoice_id": stripe_invoice_id}
 
-    from erpnext.accounts.doctype.payment_entry.payment_entry import get_payment_entry
-
     inv = frappe.get_doc("Sales Invoice", si_name)
-    
+
     # Resolve company_abbr for Stripe API calls
     company_abbr = get_company_abbr_from_company(inv.company) if inv.company else None
 
@@ -210,49 +218,50 @@ def handle_invoice_paid(event: dict):
     if not stripe_pi_id and stripe_invoice_id:
         stripe_pi_id = _resolve_payment_intent_from_stripe_invoice(stripe_invoice_id, company_abbr)
 
-    # Dedup check: use PI if available, otherwise invoice ID
     dedup_ref = stripe_pi_id or stripe_invoice_id
-    if dedup_ref and frappe.db.exists("Payment Entry", {"reference_no": dedup_ref, "docstatus": ["!=", 2]}):
-        return {"handled": True, "dedup": True, "sales_invoice": si_name}
+    with MariaDBNamedLock(f"stripe-subscription-payment-{dedup_ref}", timeout=30):
+        if dedup_ref and frappe.db.exists(
+            "Payment Entry",
+            {"reference_no": dedup_ref, "docstatus": ["!=", 2]},
+        ):
+            return {"handled": True, "dedup": True, "sales_invoice": si_name}
 
-    if inv.docstatus != 1:
-        return {"handled": False, "reason": "invoice_not_submitted", "sales_invoice": si_name}
+        inv = frappe.get_doc("Sales Invoice", si_name)
+        if inv.docstatus != 1:
+            return {"handled": False, "reason": "invoice_not_submitted", "sales_invoice": si_name}
 
-    event_currency = (obj.get("currency") or "").upper()
-    invoice_currency = (inv.currency or "").upper()
-    if event_currency and invoice_currency and event_currency != invoice_currency:
-        return {
-            "handled": False,
-            "reason": "currency_mismatch",
-            "sales_invoice": si_name,
-            "stripe_currency": event_currency,
-            "invoice_currency": invoice_currency,
-        }
+        event_currency = (obj.get("currency") or "").upper()
+        invoice_currency = (inv.currency or "").upper()
+        if event_currency and invoice_currency and event_currency != invoice_currency:
+            return {
+                "handled": False,
+                "reason": "currency_mismatch",
+                "sales_invoice": si_name,
+                "stripe_currency": event_currency,
+                "invoice_currency": invoice_currency,
+            }
 
-    outstanding = float(inv.outstanding_amount or 0)
-    if abs(float(amount_paid) - outstanding) > 0.01:
-        return {
-            "handled": False,
-            "reason": "amount_mismatch",
-            "sales_invoice": si_name,
-            "stripe_amount_paid": float(amount_paid),
-            "invoice_outstanding": outstanding,
-        }
+        outstanding = float(inv.outstanding_amount or 0)
+        paid_at = (obj.get("status_transitions") or {}).get("paid_at") or obj.get("created")
+        pe, allocated_amount, unallocated_amount = prepare_stripe_receipt_payment_entry(
+            inv,
+            float(amount_paid),
+            dedup_ref,
+            company_abbr,
+            posting_date=stripe_timestamp_date(paid_at),
+        )
+        pe.insert(ignore_permissions=True)
+        pe.submit()
 
-    alloc = float(amount_paid)
+        if frappe.get_meta("Sales Invoice").get_field("stripe_invoice_id") and stripe_invoice_id:
+            frappe.db.set_value("Sales Invoice", inv.name, "stripe_invoice_id", stripe_invoice_id, update_modified=False)
+        if frappe.get_meta("Sales Invoice").get_field("stripe_payment_intent_id") and stripe_pi_id:
+            frappe.db.set_value("Sales Invoice", inv.name, "stripe_payment_intent_id", stripe_pi_id, update_modified=False)
+        if frappe.get_meta("Payment Entry").get_field("stripe_payment_intent_id") and stripe_pi_id:
+            frappe.db.set_value("Payment Entry", pe.name, "stripe_payment_intent_id", stripe_pi_id, update_modified=False)
 
-    pe = get_payment_entry("Sales Invoice", inv.name)
-    # CRITICAL: Always prefer PI for reference_no (enables refund lookup)
-    pe.reference_no = stripe_pi_id or stripe_invoice_id
-    pe.reference_date = frappe.utils.nowdate()
-    pe.paid_amount = alloc
-    pe.received_amount = alloc
-    if pe.references:
-        pe.references[0].allocated_amount = alloc
-    pe.insert(ignore_permissions=True)
-    pe.submit()
+        frappe.db.commit()
 
-    # Post Stripe processing fee (charge-level) to fee account (e.g. 5085) with idempotency.
     try:
         if company_abbr and stripe_pi_id:
             ensure_fee_posted(
@@ -264,18 +273,6 @@ def handle_invoice_paid(event: dict):
     except Exception:
         frappe.log_error(frappe.get_traceback(), "Subscription invoice.paid: fee JE posting failed")
 
-    # Store both IDs on Sales Invoice for comprehensive tracking
-    if frappe.get_meta("Sales Invoice").get_field("stripe_invoice_id") and stripe_invoice_id:
-        frappe.db.set_value("Sales Invoice", inv.name, "stripe_invoice_id", stripe_invoice_id, update_modified=False)
-    if frappe.get_meta("Sales Invoice").get_field("stripe_payment_intent_id") and stripe_pi_id:
-        frappe.db.set_value("Sales Invoice", inv.name, "stripe_payment_intent_id", stripe_pi_id, update_modified=False)
-    
-    # Store PI on Payment Entry for refund lookup
-    if frappe.get_meta("Payment Entry").get_field("stripe_payment_intent_id") and stripe_pi_id:
-        frappe.db.set_value("Payment Entry", pe.name, "stripe_payment_intent_id", stripe_pi_id, update_modified=False)
-
-    frappe.db.commit()
-
     # Email only after the accounting entry is durable.
     try:
         from stripe_integration.stripe_integration.webhook import _send_payment_receipt_email
@@ -283,4 +280,13 @@ def handle_invoice_paid(event: dict):
     except Exception:
         frappe.log_error(frappe.get_traceback(), "Subscription invoice.paid: receipt email send failed")
 
-    return {"handled": True, "sales_invoice": inv.name, "payment_entry": pe.name, "payment_intent": stripe_pi_id}
+    return {
+        "handled": True,
+        "sales_invoice": inv.name,
+        "payment_entry": pe.name,
+        "payment_intent": stripe_pi_id,
+        "invoice_outstanding_before": outstanding,
+        "allocated_amount": allocated_amount,
+        "unallocated_amount": unallocated_amount,
+        "amount_mismatch": abs(float(amount_paid) - outstanding) > 0.01,
+    }

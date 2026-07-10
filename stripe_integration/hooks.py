@@ -24,6 +24,12 @@ doc_events.update({
     },
 })
 
+scheduler_events = {
+    "hourly": [
+        "stripe_integration.stripe_integration.reconciliation.run_hourly_reconciliation",
+    ],
+}
+
 fixtures = [
     {
         "dt": "Email Template",

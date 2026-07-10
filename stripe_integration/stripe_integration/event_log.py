@@ -1,4 +1,5 @@
 import hashlib
+
 import frappe
 from frappe.utils import now
 
@@ -27,10 +28,11 @@ def upsert_event(event: dict, payload: bytes, company_abbr: str | None = None, r
         "company": company,
         "company_abbr": company_abbr,
         "stripe_object_id": _extract_object_id(event),
-        "request_id": request_id,
         "status": status,
         "payload_hash": payload_hash,
     }
+    if request_id is not None:
+        values["request_id"] = request_id
 
     existing = frappe.db.get_value("Stripe Event Log", {"event_id": event_id}, "name")
     if existing:
@@ -52,7 +54,6 @@ def mark_event_status(event_id: str, status: str, error: str | None = None):
     update = {
         "status": status,
         "processed_at": now() if status in ("Completed", "Failed", "Ignored") else None,
+        "error": error[:2000] if error else None,
     }
-    if error:
-        update["error"] = error[:2000]
     frappe.db.set_value("Stripe Event Log", name, update, update_modified=False)

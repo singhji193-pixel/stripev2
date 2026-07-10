@@ -3,6 +3,7 @@ import json
 import sys
 import types
 import unittest
+from unittest.mock import Mock
 
 
 class WebhookAccountBindingTests(unittest.TestCase):
@@ -19,8 +20,10 @@ class WebhookAccountBindingTests(unittest.TestCase):
         fake_frappe.get_request_header = lambda key: self.headers.get(key)
         fake_frappe.get_traceback = lambda: "traceback"
         fake_frappe.log_error = lambda *args, **kwargs: None
+        fake_frappe.set_user = lambda user: None
         fake_frappe.throw = lambda msg, exc=None: (_ for _ in ()).throw(Exception(msg))
         fake_frappe.ValidationError = Exception
+        fake_frappe.utils = types.SimpleNamespace(nowdate=lambda: "2026-07-10")
         fake_frappe.db = types.SimpleNamespace(
             exists=lambda *args, **kwargs: False,
             get_value=lambda doctype, name, field: "COEngine Service Inc." if (doctype, name, field) == ("Sales Invoice", "SINV-0001", "company") else None,
@@ -40,7 +43,7 @@ class WebhookAccountBindingTests(unittest.TestCase):
             "data": {"object": {"metadata": {}}},
         }
 
-        def construct_event(payload, sig_header, secret):
+        def construct_event(payload, sig_header, secret, **kwargs):
             if secret == "whsec_coe":
                 return self.event
             raise Exception("bad secret")
@@ -51,6 +54,7 @@ class WebhookAccountBindingTests(unittest.TestCase):
         fake_utils_mod.get_webhook_secret = lambda abbr: {"COE": "whsec_coe", "COSL": "whsec_cosl"}.get(abbr)
         fake_utils_mod.get_company_abbr_from_company = lambda company: "COE" if company == "COEngine Service Inc." else "COSL" if company == "CoreOrbit Systems Ltd." else None
         fake_utils_mod.get_api_key = lambda *_args, **_kwargs: None
+        fake_utils_mod.resolve_customer_email = lambda *_args, **_kwargs: None
 
         fake_event_log = types.ModuleType("stripe_integration.stripe_integration.event_log")
         fake_event_log.upsert_event = lambda **kwargs: None
@@ -144,6 +148,83 @@ class WebhookAccountBindingTests(unittest.TestCase):
         safe = self.webhook._build_safe_payload_text(self.payload, self.event, matched_company_abbr="COE")
         out = json.loads(safe)
         self.assertEqual(out["matched_company_abbr"], "COE")
+
+    def test_completed_checkout_does_not_book_an_unpaid_session(self):
+        self.webhook._create_payment_entry_for_sales_invoice = Mock()
+        session = {
+            "id": "cs_unpaid",
+            "payment_status": "unpaid",
+            "amount_total": 10000,
+            "currency": "cad",
+            "payment_intent": "pi_unpaid",
+            "metadata": {
+                "doctype": "Sales Invoice",
+                "docname": "SINV-0001",
+                "company_abbr": "COE",
+                "requested_amount": "100.00",
+            },
+        }
+
+        result = self.webhook._handle_checkout_session(session)
+
+        self.assertFalse(result["handled"])
+        self.assertEqual(result["reason"], "checkout_not_paid")
+        self.webhook._create_payment_entry_for_sales_invoice.assert_not_called()
+
+    def test_paid_checkout_passes_verified_amount_and_currency_to_accounting(self):
+        self.webhook._create_payment_entry_for_sales_invoice = Mock(
+            return_value={"handled": True, "payment_entry": "PE-0001"}
+        )
+        session = {
+            "id": "cs_paid",
+            "status": "complete",
+            "payment_status": "paid",
+            "amount_total": 7350,
+            "currency": "cad",
+            "payment_intent": "pi_paid",
+            "metadata": {
+                "doctype": "Sales Invoice",
+                "docname": "SINV-0001",
+                "company_abbr": "COE",
+                "request_kind": "full",
+                "requested_amount": "73.50",
+            },
+        }
+
+        result = self.webhook._handle_checkout_session(session)
+
+        self.assertTrue(result["handled"])
+        self.webhook._create_payment_entry_for_sales_invoice.assert_called_once_with(
+            "SINV-0001",
+            "pi_paid",
+            73.5,
+            paid_currency="cad",
+            expected_amount="73.50",
+            request_kind="full",
+            posting_date="2026-07-10",
+        )
+
+    def test_payment_intent_succeeded_is_a_metadata_scoped_recovery_path(self):
+        self.webhook._create_payment_entry_for_sales_invoice = Mock(
+            return_value={"handled": True, "payment_entry": "PE-0001"}
+        )
+        payment_intent = {
+            "id": "pi_paid",
+            "status": "succeeded",
+            "amount_received": 7350,
+            "currency": "cad",
+            "metadata": {
+                "doctype": "Sales Invoice",
+                "docname": "SINV-0001",
+                "request_kind": "full",
+                "requested_amount": "73.50",
+            },
+        }
+
+        result = self.webhook._handle_payment_intent_succeeded(payment_intent)
+
+        self.assertTrue(result["handled"])
+        self.webhook._create_payment_entry_for_sales_invoice.assert_called_once()
 
 
 if __name__ == "__main__":

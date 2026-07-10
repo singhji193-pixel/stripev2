@@ -110,7 +110,7 @@ frappe.ui.form.on("Sales Invoice", {
     if (canRefund) {
       frm.add_custom_button("Refund Stripe Payment", () => {
         frappe.confirm(
-          "This creates a Stripe refund and cancels the linked ERP Payment Entry. A submitted Credit Note is required first. Continue?",
+          "This creates a Stripe refund and pays the submitted Credit Note from Stripe Clearing. Continue?",
           () => {
             withPasswordGate((gatePassword) => {
               frappe.call({

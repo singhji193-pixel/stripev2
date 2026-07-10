@@ -12,6 +12,8 @@
     "stripe_object_id",
     "request_id",
     "status",
+    "retry_count",
+    "last_retry_at",
     "error",
     "processed_at",
     "payload_hash"
@@ -61,6 +63,19 @@
       "in_list_view": 1,
       "label": "Status",
       "options": "Queued\nProcessing\nCompleted\nFailed\nIgnored"
+    },
+    {
+      "default": 0,
+      "fieldname": "retry_count",
+      "fieldtype": "Int",
+      "label": "Retry Count",
+      "read_only": 1
+    },
+    {
+      "fieldname": "last_retry_at",
+      "fieldtype": "Datetime",
+      "label": "Last Retry At",
+      "read_only": 1
     },
     {
       "fieldname": "error",

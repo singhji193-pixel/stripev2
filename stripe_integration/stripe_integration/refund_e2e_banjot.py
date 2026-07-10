@@ -26,7 +26,10 @@ def ensure_credit_note(invoice_name: str):
     return cn.name
 
 
-def run():
+def run(gate_password: str):
+    if not gate_password:
+        frappe.throw("gate_password is required")
+
     invoices = [
         'ACC-SINV-2026-00177',  # COE
         'ACC-SINV-2026-00183',  # COSL
@@ -35,7 +38,11 @@ def run():
 
     for inv in invoices:
         cn = ensure_credit_note(inv)
-        res = refund_payment_stripe(invoice_name=inv, gate_password='Judge@2123', reason='requested_by_customer')
+        res = refund_payment_stripe(
+            invoice_name=inv,
+            gate_password=gate_password,
+            reason="requested_by_customer",
+        )
         results.append({'invoice': inv, 'credit_note': cn, 'refund_result': res})
 
     frappe.db.commit()

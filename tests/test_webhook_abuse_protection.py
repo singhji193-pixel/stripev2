@@ -52,6 +52,7 @@ class WebhookAbuseProtectionTests(unittest.TestCase):
         fake_utils_mod.get_webhook_secret = lambda *_args, **_kwargs: None
         fake_utils_mod.get_company_abbr_from_company = lambda *_args, **_kwargs: None
         fake_utils_mod.get_api_key = lambda *_args, **_kwargs: None
+        fake_utils_mod.resolve_customer_email = lambda *_args, **_kwargs: None
 
         fake_event_log = types.ModuleType("stripe_integration.stripe_integration.event_log")
         fake_event_log.upsert_event = lambda **kwargs: None
