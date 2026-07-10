@@ -101,6 +101,22 @@ class WebhookAccountBindingTests(unittest.TestCase):
         }
         self.assertEqual(self.webhook._extract_claimed_company_abbr(event), "COE")
 
+    def test_extracts_company_from_basil_subscription_parent_metadata(self):
+        event = {
+            "data": {
+                "object": {
+                    "metadata": {},
+                    "parent": {
+                        "subscription_details": {
+                            "metadata": {"company_abbr": "COE"},
+                        }
+                    },
+                }
+            }
+        }
+
+        self.assertEqual(self.webhook._extract_claimed_company_abbr(event), "COE")
+
     def test_handle_webhook_rejects_metadata_company_mismatch_with_signature_account(self):
         self.event["data"]["object"]["metadata"] = {"company_abbr": "COSL"}
 

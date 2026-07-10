@@ -54,7 +54,24 @@ def _normalize_company_abbr(value: str | None) -> str | None:
 
 
 def _extract_event_metadata(event: dict | None) -> dict:
-    return (((event or {}).get("data") or {}).get("object") or {}).get("metadata") or {}
+    obj = (((event or {}).get("data") or {}).get("object") or {})
+    metadata = obj.get("metadata") or {}
+    if metadata:
+        return metadata
+
+    # Basil API versions moved subscription invoice metadata under parent.
+    subscription_details = ((obj.get("parent") or {}).get("subscription_details") or {})
+    metadata = subscription_details.get("metadata") or {}
+    if metadata:
+        return metadata
+
+    # Retain a final fallback for invoice payloads that only include line metadata.
+    for line in ((obj.get("lines") or {}).get("data") or []):
+        metadata = (line or {}).get("metadata") or {}
+        if metadata:
+            return metadata
+
+    return {}
 
 
 def _extract_claimed_company_abbr(event: dict | None) -> str | None:
@@ -347,31 +364,43 @@ def handle_webhook():
             frappe.log_error(frappe.get_traceback(), "Stripe Event Log upsert failed (Queued)")
 
     try:
+        handler_result = {"handled": False, "reason": "event_not_routed", "event_type": event_type}
         if event_type in ("checkout.session.completed", "checkout.session.async_payment_succeeded"):
             session = event["data"]["object"]
-            _handle_checkout_session(session)
+            handler_result = _handle_checkout_session(session) or {"handled": True}
         elif event_type == "invoice.paid":
-            handle_invoice_paid(event)
+            handler_result = handle_invoice_paid(event) or {"handled": False, "reason": "empty_handler_result"}
+            if not handler_result.get("handled"):
+                frappe.throw(
+                    f"Stripe invoice.paid was not reconciled: {handler_result.get('reason') or 'unknown'}",
+                    frappe.ValidationError,
+                )
         elif event_type.startswith("customer.subscription.") and event_type not in ("customer.subscription.created", "customer.subscription.trial_will_end"):
-            sync_subscription_from_webhook_event(event)
+            handler_result = sync_subscription_from_webhook_event(event) or {"handled": True}
         elif event_type in ("charge.refunded", "refund.updated"):
-            _handle_refund_event(event)
+            handler_result = _handle_refund_event(event) or {"handled": True}
         elif event_type.startswith("payout."):
-            sync_payout_from_webhook_event(event)
+            handler_result = sync_payout_from_webhook_event(event, company_abbr_hint=company_abbr) or {"handled": True}
+
+        final_status = "Completed" if handler_result.get("handled") else "Ignored"
 
         if event_id and not _integration_request_is_completed(event_id):
             _log_integration_request(
                 event_id=event_id,
-                status="Completed",
+                status=final_status,
                 payload_text=safe_payload_text,
-                output_text=json.dumps({"handled": True}),
+                output_text=json.dumps(handler_result, default=str),
             )
         if event_id:
             try:
-                mark_event_status(event_id, "Completed")
+                mark_event_status(
+                    event_id,
+                    final_status,
+                    None if handler_result.get("handled") else handler_result.get("reason"),
+                )
             except Exception:
-                frappe.log_error(frappe.get_traceback(), "Stripe Event Log update failed (Completed)")
-        return {"status": "ok"}
+                frappe.log_error(frappe.get_traceback(), f"Stripe Event Log update failed ({final_status})")
+        return {"status": "ok", "result": handler_result}
     except Exception as e:
         if event_id:
             try:
