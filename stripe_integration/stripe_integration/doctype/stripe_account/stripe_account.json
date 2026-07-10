@@ -7,6 +7,7 @@
   "field_order": [
     "enabled",
     "test_mode",
+    "payout_sync_enabled",
     "company",
     "company_abbr",
     "publishable_key",
@@ -27,10 +28,17 @@
       "label": "Test Mode"
     },
     {
+      "default": 1,
+      "fieldname": "payout_sync_enabled",
+      "fieldtype": "Check",
+      "label": "Enable Payout Sync"
+    },
+    {
       "fieldname": "company",
       "fieldtype": "Link",
       "label": "Company",
-      "options": "Company"
+      "options": "Company",
+      "reqd": 1
     },
     {
       "fieldname": "company_abbr",

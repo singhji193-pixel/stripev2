@@ -1,13 +1,20 @@
 import frappe
 from frappe.utils import flt
 
+from stripe_integration.stripe_integration.accounting import (
+    MariaDBNamedLock,
+    route_payment_entry_to_stripe_clearing,
+    validate_stripe_currency,
+)
+from stripe_integration.stripe_integration.utils import get_company_abbr_from_company
+
 
 def _find_matching_payment_entry(stripe_ref_id: str):
     """Find Payment Entry by PI, invoice ID, or charge ID.
-    
+
     Supports multiple Stripe reference types for maximum linkage success:
     - Payment Intent ID (pi_xxx)
-    - Stripe Invoice ID (in_xxx) 
+    - Stripe Invoice ID (in_xxx)
     - Charge ID (ch_xxx)
     """
     if not stripe_ref_id:
@@ -80,6 +87,25 @@ def _find_submitted_credit_note(invoice_name: str):
     )
 
 
+def _find_existing_refund_payment_entry(stripe_refund_id: str):
+    if not stripe_refund_id:
+        return None
+
+    if frappe.get_meta("Payment Entry").get_field("stripe_refund_id"):
+        name = frappe.db.get_value(
+            "Payment Entry",
+            {"stripe_refund_id": stripe_refund_id, "docstatus": ["!=", 2]},
+            "name",
+        )
+        if name:
+            return name
+    return frappe.db.get_value(
+        "Payment Entry",
+        {"reference_no": stripe_refund_id, "docstatus": ["!=", 2]},
+        "name",
+    )
+
+
 def _comment_on_invoice(invoice_name: str, text: str):
     if not invoice_name:
         return
@@ -103,8 +129,16 @@ def _create_refund_payment_entry(credit_note_name: str, stripe_payment_intent_id
         from erpnext.accounts.doctype.payment_entry.payment_entry import get_payment_entry
 
         pe = get_payment_entry("Sales Invoice", credit_note_name)
+        company_abbr = get_company_abbr_from_company(pe.get("company"))
+        mapping = route_payment_entry_to_stripe_clearing(pe, company_abbr)
+        credit_note_currency = frappe.db.get_value("Sales Invoice", credit_note_name, "currency")
+        validate_stripe_currency(
+            mapping.get("currency"),
+            credit_note_currency,
+            f"Stripe Clearing for Credit Note {credit_note_name}",
+        )
 
-        reference_no = stripe_payment_intent_id or stripe_refund_id
+        reference_no = stripe_refund_id or stripe_payment_intent_id
         if reference_no:
             pe.reference_no = reference_no
 
@@ -130,11 +164,16 @@ def _create_refund_payment_entry(credit_note_name: str, stripe_payment_intent_id
             if not allocated and pe.references:
                 pe.references[0].allocated_amount = amount
 
+        if pe.meta.get_field("stripe_payment_intent_id") and stripe_payment_intent_id:
+            pe.stripe_payment_intent_id = stripe_payment_intent_id
+        if pe.meta.get_field("stripe_refund_id") and stripe_refund_id:
+            pe.stripe_refund_id = stripe_refund_id
+
         pe.insert(ignore_permissions=True)
         pe.submit()
         return pe.name
     except Exception:
-        frappe.log_error(frappe.get_traceback(), "Stripe partial refund: credit note allocation failed")
+        frappe.log_error(frappe.get_traceback(), "Stripe refund: credit note allocation failed")
         return None
 
 
@@ -144,15 +183,14 @@ def apply_refund_to_erp(
     refund_amount: float,
     currency: str,
     source: str = "webhook.refund",
-    invoice_name: str = None,
+    invoice_name: str | None = None,
 ):
     """Link Stripe refund into ERP records.
 
-    Behavior:
-    - Full refund => cancel matching submitted Payment Entry
-    - Partial refund => try credit-note allocation via refund Payment Entry
-      and fallback to manual adjustment comment when allocation is not possible.
-    
+    Every successful Stripe refund requires a submitted Credit Note and creates
+    an outgoing Payment Entry against that Credit Note. The original receipt is
+    retained as the historical record of the money received.
+
     Args:
         stripe_payment_intent_id: PI, invoice ID, or charge ID to match PE
         stripe_refund_id: Stripe refund object ID
@@ -166,97 +204,97 @@ def apply_refund_to_erp(
     if refund_amount <= 0:
         return {"handled": False, "reason": "non_positive_refund_amount"}
 
-    # Try multiple paths to find the Payment Entry
-    pe = _find_matching_payment_entry(stripe_payment_intent_id)
-    
-    # Fallback: find PE by invoice if direct lookup failed
-    if not pe and invoice_name:
-        pe = _find_payment_entry_by_invoice(invoice_name)
-    
-    if not pe:
-        return {
-            "handled": False,
-            "reason": "payment_entry_not_found",
-            "stripe_payment_intent_id": stripe_payment_intent_id,
-            "invoice_name": invoice_name,
-        }
+    with MariaDBNamedLock(f"stripe-refund-{stripe_refund_id}", timeout=30):
+        existing_refund_pe = _find_existing_refund_payment_entry(stripe_refund_id)
+        if existing_refund_pe:
+            return {
+                "handled": True,
+                "dedup": True,
+                "refund_payment_entry": existing_refund_pe,
+                "stripe_refund_id": stripe_refund_id,
+            }
 
-    paid_amount = flt(pe.paid_amount or pe.received_amount or 0)
-    resolved_invoice_name = invoice_name
-    if pe.references:
-        for ref in pe.references:
-            if ref.reference_doctype == "Sales Invoice" and ref.reference_name:
-                resolved_invoice_name = ref.reference_name
-                break
+        pe = _find_matching_payment_entry(stripe_payment_intent_id)
+        if not pe and invoice_name:
+            pe = _find_payment_entry_by_invoice(invoice_name)
+        if not pe:
+            return {
+                "handled": False,
+                "reason": "payment_entry_not_found",
+                "stripe_payment_intent_id": stripe_payment_intent_id,
+                "invoice_name": invoice_name,
+            }
 
-    epsilon = 0.01
-    if refund_amount + epsilon < paid_amount:
+        paid_amount = flt(pe.paid_amount or pe.received_amount or 0)
+        resolved_invoice_name = invoice_name
+        if pe.references:
+            for ref in pe.references:
+                if ref.reference_doctype == "Sales Invoice" and ref.reference_name:
+                    resolved_invoice_name = ref.reference_name
+                    break
+
+        invoice_currency = frappe.db.get_value("Sales Invoice", resolved_invoice_name, "currency")
+        validate_stripe_currency(currency, invoice_currency, f"refund {stripe_refund_id}")
+
         credit_note_name = _find_submitted_credit_note(resolved_invoice_name)
-        if credit_note_name:
-            refund_pe_name = _create_refund_payment_entry(
-                credit_note_name=credit_note_name,
-                stripe_payment_intent_id=stripe_payment_intent_id,
-                stripe_refund_id=stripe_refund_id,
-                refund_amount=refund_amount,
+        if not credit_note_name:
+            _comment_on_invoice(
+                resolved_invoice_name,
+                (
+                    f"Stripe refund {stripe_refund_id} for {currency} {refund_amount:.2f} requires "
+                    "a submitted Credit Note before ERP accounting can be completed."
+                ),
             )
-            if refund_pe_name:
-                _comment_on_invoice(
-                    resolved_invoice_name,
-                    (
-                        f"Stripe partial refund auto-linked ({currency} {refund_amount:.2f}, "
-                        f"refund {stripe_refund_id}, source {source}) for PI {stripe_payment_intent_id}. "
-                        f"Created refund Payment Entry {refund_pe_name} allocated to Credit Note {credit_note_name}."
-                    ),
-                )
-                frappe.db.commit()
-                return {
-                    "handled": True,
-                    "mode": "partial_refund_credit_note_allocated",
-                    "payment_entry": pe.name,
-                    "refund_payment_entry": refund_pe_name,
-                    "invoice": resolved_invoice_name,
-                    "credit_note": credit_note_name,
-                    "refund_amount": refund_amount,
-                    "paid_amount": paid_amount,
-                }
+            return {
+                "handled": False,
+                "reason": "credit_note_required",
+                "payment_entry": pe.name,
+                "invoice": resolved_invoice_name,
+                "refund_amount": refund_amount,
+            }
+
+        credit_outstanding = abs(
+            flt(frappe.db.get_value("Sales Invoice", credit_note_name, "outstanding_amount") or 0)
+        )
+        if refund_amount > credit_outstanding + 0.01:
+            return {
+                "handled": False,
+                "reason": "refund_exceeds_credit_note_outstanding",
+                "credit_note": credit_note_name,
+                "refund_amount": refund_amount,
+                "credit_note_outstanding": credit_outstanding,
+            }
+
+        refund_pe_name = _create_refund_payment_entry(
+            credit_note_name=credit_note_name,
+            stripe_payment_intent_id=stripe_payment_intent_id,
+            stripe_refund_id=stripe_refund_id,
+            refund_amount=refund_amount,
+        )
+        if not refund_pe_name:
+            return {
+                "handled": False,
+                "reason": "refund_payment_entry_failed",
+                "credit_note": credit_note_name,
+            }
 
         _comment_on_invoice(
             resolved_invoice_name,
             (
-                f"Stripe partial refund received ({currency} {refund_amount:.2f}, "
-                f"refund {stripe_refund_id}, source {source}) for PI {stripe_payment_intent_id}. "
-                "Payment Entry was not auto-adjusted; create a manual adjustment for the partial refund."
+                f"Stripe refund linked ({currency} {refund_amount:.2f}, refund {stripe_refund_id}, "
+                f"source {source}) for PI {stripe_payment_intent_id}. Created refund Payment Entry "
+                f"{refund_pe_name} against Credit Note {credit_note_name}."
             ),
         )
+        frappe.db.commit()
+
         return {
             "handled": True,
-            "mode": "partial_refund_manual_adjustment_required",
+            "mode": "refund_credit_note_allocated",
             "payment_entry": pe.name,
+            "refund_payment_entry": refund_pe_name,
             "invoice": resolved_invoice_name,
             "credit_note": credit_note_name,
             "refund_amount": refund_amount,
             "paid_amount": paid_amount,
         }
-
-    if pe.docstatus == 1:
-        pe.cancel()
-
-    _comment_on_invoice(
-        resolved_invoice_name,
-        (
-            f"Stripe refund applied: {currency} {refund_amount:.2f} (refund {stripe_refund_id}, "
-            f"source {source}) for PI {stripe_payment_intent_id}. "
-            f"Linked Payment Entry {pe.name} was cancelled."
-        ),
-    )
-
-    frappe.db.commit()
-
-    return {
-        "handled": True,
-        "mode": "full_refund_cancel_payment_entry",
-        "payment_entry": pe.name,
-        "invoice": resolved_invoice_name,
-        "refund_amount": refund_amount,
-        "paid_amount": paid_amount,
-    }

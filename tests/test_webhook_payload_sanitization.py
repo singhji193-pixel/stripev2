@@ -4,6 +4,8 @@ import sys
 import types
 import unittest
 
+from module_isolation import restore_modules
+
 
 class WebhookPayloadSanitizationTests(unittest.TestCase):
     def setUp(self):
@@ -24,6 +26,7 @@ class WebhookPayloadSanitizationTests(unittest.TestCase):
         fake_utils_mod.get_webhook_secret = lambda *_args, **_kwargs: None
         fake_utils_mod.get_company_abbr_from_company = lambda *_args, **_kwargs: None
         fake_utils_mod.get_api_key = lambda *_args, **_kwargs: None
+        fake_utils_mod.resolve_customer_email = lambda *_args, **_kwargs: None
 
         fake_event_log = types.ModuleType("stripe_integration.stripe_integration.event_log")
         fake_event_log.upsert_event = lambda **kwargs: None
@@ -56,8 +59,7 @@ class WebhookPayloadSanitizationTests(unittest.TestCase):
         self.webhook = importlib.import_module("stripe_integration.stripe_integration.webhook")
 
     def tearDown(self):
-        sys.modules.clear()
-        sys.modules.update(self._orig_modules)
+        restore_modules(self._orig_modules)
 
     def test_build_safe_payload_text_redacts_pii_and_masks_ids(self):
         raw_event = {

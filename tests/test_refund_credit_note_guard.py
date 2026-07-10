@@ -4,6 +4,8 @@ import types
 import unittest
 from unittest.mock import Mock
 
+from module_isolation import restore_modules
+
 
 class RefundCreditNoteGuardTests(unittest.TestCase):
     def setUp(self):
@@ -67,8 +69,7 @@ class RefundCreditNoteGuardTests(unittest.TestCase):
         self.frappe = fake_frappe
 
     def tearDown(self):
-        sys.modules.clear()
-        sys.modules.update(self._orig_modules)
+        restore_modules(self._orig_modules)
 
     def test_has_submitted_credit_note_true_when_return_invoice_exists(self):
         self.frappe.db.exists.return_value = "SINV-CN-0001"

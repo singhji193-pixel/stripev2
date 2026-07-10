@@ -1,7 +1,18 @@
+import hashlib
 import time
 
 import frappe
 import stripe
+from frappe.utils import flt, fmt_money, now
+from frappe.utils.password import check_password
+
+from stripe_integration.stripe_integration.accounting import MariaDBNamedLock
+from stripe_integration.stripe_integration.refunds import apply_refund_to_erp
+from stripe_integration.stripe_integration.utils import (
+    get_api_key,
+    get_company_abbr_from_company,
+)
+
 
 def _stripe_get(obj, key, default=None):
     if obj is None:
@@ -9,14 +20,15 @@ def _stripe_get(obj, key, default=None):
     if isinstance(obj, dict):
         return obj.get(key, default)
     try:
-        if hasattr(obj, key):
-            value = getattr(obj, key)
-            return default if value is None else value
+        value = obj[key]
+        return default if value is None else value
     except Exception:
         pass
     try:
-        value = obj[key]
-        return default if value is None else value
+        if hasattr(obj, key):
+            value = getattr(obj, key)
+            if not callable(value):
+                return default if value is None else value
     except Exception:
         pass
     try:
@@ -27,15 +39,6 @@ def _stripe_get(obj, key, default=None):
     except Exception:
         pass
     return default
-
-from frappe.utils import flt, get_url, now, fmt_money
-from frappe.utils.password import check_password
-
-from stripe_integration.stripe_integration.utils import (
-    get_api_key,
-    get_company_abbr_from_company,
-)
-from stripe_integration.stripe_integration.refunds import apply_refund_to_erp
 
 
 STRIPE_ACTION_ROLES = ("System Manager", "Accounts Manager", "Accounts User")
@@ -118,7 +121,11 @@ def _require_doc_permission(doctype: str, name: str, ptype: str = "write"):
         frappe.throw("Not permitted", frappe.PermissionError)
 
 
-def _require_stripe_action_guard(gate_password: str = None, invoice_name: str = None, require_password: bool = True):
+def _require_stripe_action_guard(
+    gate_password: str | None = None,
+    invoice_name: str | None = None,
+    require_password: bool = True,
+):
     user_roles = set(frappe.get_roles(frappe.session.user))
     if not any(role in user_roles for role in STRIPE_ACTION_ROLES):
         _log_refund_security_audit(
@@ -170,7 +177,10 @@ def _require_stripe_action_guard(gate_password: str = None, invoice_name: str = 
     _log_refund_security_audit(invoice_name, check="password_gate", outcome="passed")
 
 
-def _enforce_refund_threshold_approval(refund_amount: float, invoice_name: str = None):
+def _enforce_refund_threshold_approval(
+    refund_amount: float,
+    invoice_name: str | None = None,
+):
     """Optional extra approval gate for high-value refunds.
 
     Stripe Settings > Refund Approval Threshold Amount (currency amount):
@@ -303,13 +313,23 @@ def _compute_request_amount_and_kind(inv):
 def _create_payment_link(amount: float, currency_lc: str, invoice_name: str, company_abbr: str, metadata: dict):
     """Create a Stripe Payment Link for the given invoice. Does not expire. Deactivated via webhook after payment."""
 
+    api_key = get_api_key(company_abbr)
     base_domain = "https://coengine.ai" if company_abbr == "COE" else "https://join.coreorbit.io"
     success_url = f"{base_domain}/payment-success?invoice={invoice_name}"
+    unit_amount = round(amount * 100)
+    signature = hashlib.sha256(
+        (
+            f"{company_abbr}:{invoice_name}:{currency_lc}:{unit_amount}:"
+            f"{metadata.get('request_kind') or ''}"
+        ).encode()
+    ).hexdigest()[:32]
 
     price = stripe.Price.create(
         currency=currency_lc,
-        unit_amount=int(round(amount * 100)),
+        unit_amount=unit_amount,
         product_data={"name": f"Invoice {invoice_name}"},
+        idempotency_key=f"erpnext-price-{signature}",
+        api_key=api_key,
     )
 
     link = stripe.PaymentLink.create(
@@ -317,7 +337,16 @@ def _create_payment_link(amount: float, currency_lc: str, invoice_name: str, com
         after_completion={"type": "redirect", "redirect": {"url": success_url}},
         payment_intent_data={"metadata": metadata},
         metadata=metadata,
+        idempotency_key=f"erpnext-payment-link-{signature}",
+        api_key=api_key,
     )
+
+    if _stripe_get(link, "active") is False:
+        link = stripe.PaymentLink.modify(
+            _stripe_get(link, "id"),
+            active=True,
+            api_key=api_key,
+        )
 
     return link
 
@@ -335,7 +364,7 @@ def _brand_name_from_company_abbr(company_abbr: str) -> str:
 
 def _resolve_sender(company_abbr: str) -> str:
     if (company_abbr or "").upper() == "COSL":
-        return "CoreOrbit <next@coengine.ai>"
+        return "CoreOrbit Billing <billing@coreorbit.io>"
     return "COEngine <erp@coengine.ai>"
 
 
@@ -434,9 +463,18 @@ def _has_submitted_credit_note(invoice_name: str) -> bool:
 
 
 def _require_submitted_credit_note(invoice_name: str):
-    if _has_submitted_credit_note(invoice_name):
+    credit_note_name = frappe.db.get_value(
+        "Sales Invoice",
+        {
+            "docstatus": 1,
+            "is_return": 1,
+            "return_against": invoice_name,
+        },
+        "name",
+    )
+    if credit_note_name:
         _log_refund_security_audit(invoice_name, check="credit_note_guard", outcome="passed")
-        return
+        return credit_note_name
 
     _log_refund_security_audit(invoice_name, check="credit_note_guard", outcome="blocked_missing_credit_note")
     frappe.throw(
@@ -488,7 +526,7 @@ def _send_refund_email(invoice_name: str, company_abbr: str, refund_payload: dic
 
 
 @frappe.whitelist()
-def void_payment_link_stripe(invoice_name: str, gate_password: str = None):
+def void_payment_link_stripe(invoice_name: str, gate_password: str | None = None):
     """Void an active Stripe checkout link for a submitted Sales Invoice.
 
     - Checkout Session: expire session
@@ -514,16 +552,16 @@ def void_payment_link_stripe(invoice_name: str, gate_password: str = None):
     if not company_abbr:
         frappe.throw("Could not determine company abbr from invoice")
 
-    stripe.api_key = get_api_key(company_abbr)
+    api_key = get_api_key(company_abbr)
 
     result = {"ok": True, "invoice": invoice_name, "id": session_or_link_id}
 
     try:
         if session_or_link_id and str(session_or_link_id).startswith("cs_"):
-            stripe.checkout.Session.expire(session_or_link_id)
+            stripe.checkout.Session.expire(session_or_link_id, api_key=api_key)
             result["voided_type"] = "checkout_session"
         elif session_or_link_id and str(session_or_link_id).startswith("plink_"):
-            stripe.PaymentLink.modify(session_or_link_id, active=False)
+            stripe.PaymentLink.modify(session_or_link_id, active=False, api_key=api_key)
             result["voided_type"] = "payment_link"
         else:
             # Unknown id type: best effort by URL parse for payment links
@@ -545,13 +583,17 @@ def void_payment_link_stripe(invoice_name: str, gate_password: str = None):
 
 
 @frappe.whitelist()
-def refund_payment_stripe(invoice_name: str, gate_password: str = None, reason: str = "requested_by_customer"):
-    """Create a full Stripe refund for the invoice's latest Stripe payment and mirror it in ERP.
+def refund_payment_stripe(
+    invoice_name: str,
+    gate_password: str | None = None,
+    reason: str = "requested_by_customer",
+):
+    """Create a full Stripe refund and pay its submitted ERP Credit Note.
 
     Notes:
-    - This endpoint currently supports full refunds only (small/safe scope for PR2).
+    - This endpoint refunds the remaining refundable amount on the selected Stripe payment.
     - A submitted Credit Note (return Sales Invoice against this invoice) is required before Stripe refund.
-    - ERP linkage is done by cancelling the matching submitted Payment Entry.
+    - ERP linkage creates an outgoing Payment Entry against the Credit Note.
     """
 
     doctype = "Sales Invoice"
@@ -563,7 +605,7 @@ def refund_payment_stripe(invoice_name: str, gate_password: str = None, reason: 
     if inv.docstatus != 1:
         frappe.throw("Invoice must be Submitted before refunding")
 
-    _require_submitted_credit_note(invoice_name)
+    credit_note_name = _require_submitted_credit_note(invoice_name)
 
     pi_id = inv.get("stripe_payment_intent_id")
     if not pi_id:
@@ -594,19 +636,37 @@ def refund_payment_stripe(invoice_name: str, gate_password: str = None, reason: 
     if not company_abbr:
         frappe.throw("Could not determine company abbr from invoice")
 
-    stripe.api_key = get_api_key(company_abbr)
+    api_key = get_api_key(company_abbr)
 
-    payment = stripe.PaymentIntent.retrieve(pi_id)
-    amount_received = float((_stripe_get(payment, "amount_received") or 0) / 100.0)
+    payment = stripe.PaymentIntent.retrieve(pi_id, api_key=api_key)
+    amount_received_cents = int(_stripe_get(payment, "amount_received") or 0)
+    amount_refunded_cents = 0
+    latest_charge = _stripe_get(payment, "latest_charge")
+    if latest_charge:
+        latest_charge_id = _stripe_get(latest_charge, "id") or latest_charge
+        charge = stripe.Charge.retrieve(latest_charge_id, api_key=api_key)
+        amount_refunded_cents = int(_stripe_get(charge, "amount_refunded") or 0)
+    refundable_cents = max(amount_received_cents - amount_refunded_cents, 0)
+    refundable_amount = refundable_cents / 100.0
     currency = (_stripe_get(payment, "currency") or inv.get("currency") or "CAD").upper()
 
-    if amount_received <= 0:
-        frappe.throw("Stripe payment has no received amount to refund")
+    if refundable_cents <= 0:
+        frappe.throw("Stripe payment has no remaining refundable amount")
 
-    _enforce_refund_threshold_approval(amount_received, invoice_name=invoice_name)
+    credit_note_outstanding = abs(
+        flt(frappe.db.get_value("Sales Invoice", credit_note_name, "outstanding_amount") or 0)
+    )
+    if refundable_amount > credit_note_outstanding + 0.01:
+        frappe.throw(
+            f"Credit Note {credit_note_name} has only {credit_note_outstanding:.2f} outstanding; "
+            f"it cannot account for a {refundable_amount:.2f} Stripe refund"
+        )
+
+    _enforce_refund_threshold_approval(refundable_amount, invoice_name=invoice_name)
 
     refund = stripe.Refund.create(
         payment_intent=pi_id,
+        amount=refundable_cents,
         reason=reason or "requested_by_customer",
         metadata={
             "doctype": "Sales Invoice",
@@ -616,6 +676,8 @@ def refund_payment_stripe(invoice_name: str, gate_password: str = None, reason: 
             "site": frappe.local.site,
             "source": "erp_manual_refund",
         },
+        idempotency_key=f"erpnext-full-refund-{company_abbr}-{invoice_name}-{pi_id}",
+        api_key=api_key,
     )
 
     result_payload = {
@@ -634,6 +696,7 @@ def refund_payment_stripe(invoice_name: str, gate_password: str = None, reason: 
         refund_amount=result_payload["amount"],
         currency=result_payload["currency"],
         source="api.refund_payment_stripe",
+        invoice_name=invoice_name,
     )
     result_payload["erp_linkage"] = linked
 
@@ -647,7 +710,7 @@ def refund_payment_stripe(invoice_name: str, gate_password: str = None, reason: 
 
 
 @frappe.whitelist()
-def request_payment_stripe(invoice_name: str, gate_password: str = None):
+def request_payment_stripe(invoice_name: str, gate_password: str | None = None):
     """Primary: Stripe Payment Link (no expiry). Deactivated automatically after payment via webhook.
 
     Uses custom fields on Sales Invoice (Address & Contact -> Payment Configuration).
@@ -661,49 +724,75 @@ def request_payment_stripe(invoice_name: str, gate_password: str = None):
     if inv.docstatus != 1:
         frappe.throw("Invoice must be Submitted before requesting payment")
 
-    amount, request_kind = _compute_request_amount_and_kind(inv)
-
     company = inv.get("company")
     company_abbr = get_company_abbr_from_company(company)
     if not company_abbr:
         frappe.throw("Could not determine company abbr from invoice")
 
-    stripe.api_key = get_api_key(company_abbr)
+    api_key = get_api_key(company_abbr)
 
-    currency = inv.get("currency") or frappe.get_cached_value("Company", company, "default_currency")
-    currency_lc = (currency or "CAD").lower()
+    with MariaDBNamedLock(f"stripe-payment-link-{invoice_name}", timeout=30):
+        inv = frappe.get_doc(doctype, invoice_name)
+        if inv.docstatus != 1:
+            frappe.throw("Invoice must be Submitted before requesting payment")
 
-    customer_email = _get_recipient_email(inv)
-    if not customer_email:
-        frappe.throw("No customer email found on invoice/customer")
+        amount, request_kind = _compute_request_amount_and_kind(inv)
+        currency = inv.get("currency") or frappe.get_cached_value("Company", company, "default_currency")
+        currency_lc = (currency or "CAD").lower()
+        customer_email = _get_recipient_email(inv)
+        if not customer_email:
+            frappe.throw("No customer email found on invoice/customer")
 
-    metadata = {
-        "doctype": doctype,
-        "docname": invoice_name,
-        "company": company,
-        "company_abbr": company_abbr,
-        "site": frappe.local.site,
-        "source": "payment_link",
-        "request_kind": request_kind,
-        "payment_split_type": inv.get("payment_split_type"),
-        "initial_payment_percentage": inv.get("initial_payment_percentage"),
-        "requested_amount": str(amount),
-    }
+        metadata = {
+            "doctype": doctype,
+            "docname": invoice_name,
+            "company": company,
+            "company_abbr": company_abbr,
+            "site": frappe.local.site,
+            "source": "payment_link",
+            "request_kind": request_kind,
+            "payment_split_type": inv.get("payment_split_type"),
+            "initial_payment_percentage": inv.get("initial_payment_percentage"),
+            "requested_amount": str(amount),
+        }
+        existing_id = inv.get("stripe_checkout_session_id")
+        existing_amount = flt(inv.get("stripe_payment_link_amount") or 0)
+        existing_currency = (inv.get("stripe_payment_link_currency") or "").upper()
+        link = None
+        reused = False
 
-    link = _create_payment_link(amount, currency_lc, invoice_name, company_abbr, metadata)
-    checkout_url = link.url
-    session_id = link.id
-    mode_used = "payment_link"
+        if existing_id and str(existing_id).startswith("plink_"):
+            try:
+                existing_link = stripe.PaymentLink.retrieve(existing_id, api_key=api_key)
+                if (
+                    bool(_stripe_get(existing_link, "active"))
+                    and abs(existing_amount - amount) <= 0.01
+                    and existing_currency == currency.upper()
+                ):
+                    link = existing_link
+                    reused = True
+                elif bool(_stripe_get(existing_link, "active")):
+                    stripe.PaymentLink.modify(existing_id, active=False, api_key=api_key)
+            except Exception:
+                frappe.log_error(frappe.get_traceback(), "Stripe existing Payment Link lookup failed")
 
-    _safe_set_value(doctype, invoice_name, "stripe_checkout_url", checkout_url)
-    _safe_set_value(doctype, invoice_name, "stripe_checkout_session_id", session_id)
-    _safe_set_value(doctype, invoice_name, "stripe_payment_link_amount", amount)
-    _safe_set_value(doctype, invoice_name, "stripe_payment_link_currency", currency)
-    _safe_set_value(doctype, invoice_name, "stripe_last_payment_link_sent", now())
+        if not link:
+            link = _create_payment_link(amount, currency_lc, invoice_name, company_abbr, metadata)
 
-    _safe_append_history(inv, f"{now()} | {request_kind} | {currency} {amount:.2f} | {mode_used} | {session_id}")
+        checkout_url = _stripe_get(link, "url")
+        session_id = _stripe_get(link, "id")
+        mode_used = "payment_link"
 
-    frappe.db.commit()
+        _safe_set_value(doctype, invoice_name, "stripe_checkout_url", checkout_url)
+        _safe_set_value(doctype, invoice_name, "stripe_checkout_session_id", session_id)
+        _safe_set_value(doctype, invoice_name, "stripe_payment_link_amount", amount)
+        _safe_set_value(doctype, invoice_name, "stripe_payment_link_currency", currency)
+        _safe_set_value(doctype, invoice_name, "stripe_last_payment_link_sent", now())
+        _safe_append_history(
+            inv,
+            f"{now()} | {request_kind} | {currency} {amount:.2f} | {mode_used} | {session_id} | reused={int(reused)}",
+        )
+        frappe.db.commit()
 
     _send_payment_email(customer_email, invoice_name, amount, currency, checkout_url, request_kind, mode_used, company_abbr)
 
@@ -716,6 +805,7 @@ def request_payment_stripe(invoice_name: str, gate_password: str = None):
         "email": customer_email,
         "amount": amount,
         "currency": currency,
+        "reused": reused,
     }
 
 

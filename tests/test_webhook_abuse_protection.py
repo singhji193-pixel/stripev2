@@ -3,6 +3,8 @@ import sys
 import types
 import unittest
 
+from module_isolation import restore_modules
+
 
 class _FakeCache:
     def __init__(self):
@@ -52,6 +54,7 @@ class WebhookAbuseProtectionTests(unittest.TestCase):
         fake_utils_mod.get_webhook_secret = lambda *_args, **_kwargs: None
         fake_utils_mod.get_company_abbr_from_company = lambda *_args, **_kwargs: None
         fake_utils_mod.get_api_key = lambda *_args, **_kwargs: None
+        fake_utils_mod.resolve_customer_email = lambda *_args, **_kwargs: None
 
         fake_event_log = types.ModuleType("stripe_integration.stripe_integration.event_log")
         fake_event_log.upsert_event = lambda **kwargs: None
@@ -85,8 +88,7 @@ class WebhookAbuseProtectionTests(unittest.TestCase):
         self.frappe = fake_frappe
 
     def tearDown(self):
-        sys.modules.clear()
-        sys.modules.update(self._orig_modules)
+        restore_modules(self._orig_modules)
 
     def test_webhook_blocks_large_payload(self):
         payload = b"x" * (self.webhook.WEBHOOK_MAX_PAYLOAD_BYTES + 1)

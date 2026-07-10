@@ -3,6 +3,8 @@ import sys
 import types
 import unittest
 
+from module_isolation import restore_modules
+
 
 class RefundSecurityAuditTrailTests(unittest.TestCase):
     def setUp(self):
@@ -101,8 +103,7 @@ class RefundSecurityAuditTrailTests(unittest.TestCase):
         self.frappe = fake_frappe
 
     def tearDown(self):
-        sys.modules.clear()
-        sys.modules.update(self._orig_modules)
+        restore_modules(self._orig_modules)
 
     def _find_event(self, check, outcome):
         for event in self.audit_events:

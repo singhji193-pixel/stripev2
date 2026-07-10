@@ -88,6 +88,17 @@ function requestPaymentMethod(frm) {
         return;
       }
 
+      if (out.subscription_created) {
+        frappe.show_alert({
+          message: out.reused_saved_payment_method
+            ? __("Stripe subscription created using the customer's saved payment method.")
+            : __("Stripe subscription created."),
+          indicator: "green"
+        });
+        frm.reload_doc();
+        return;
+      }
+
       const link = out.checkout_url || "";
       frappe.msgprint({
         title: __("Payment Method Request"),

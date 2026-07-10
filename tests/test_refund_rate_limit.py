@@ -3,6 +3,8 @@ import sys
 import types
 import unittest
 
+from module_isolation import restore_modules
+
 
 class _FakeCache:
     def __init__(self):
@@ -72,8 +74,7 @@ class RefundRateLimitTests(unittest.TestCase):
         self.api = importlib.import_module("stripe_integration.stripe_integration.api")
 
     def tearDown(self):
-        sys.modules.clear()
-        sys.modules.update(self._orig_modules)
+        restore_modules(self._orig_modules)
 
     def test_refund_rate_limit_allows_first_attempts(self):
         for _ in range(self.api.REFUND_RATE_LIMIT_MAX_ATTEMPTS):

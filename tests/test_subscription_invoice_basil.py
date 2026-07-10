@@ -4,6 +4,8 @@ import types
 import unittest
 from datetime import datetime, timezone
 
+from module_isolation import restore_modules
+
 
 class SubscriptionInvoiceBasilTests(unittest.TestCase):
     def setUp(self):
@@ -55,8 +57,7 @@ class SubscriptionInvoiceBasilTests(unittest.TestCase):
         self.module = importlib.import_module("stripe_integration.stripe_integration.subscription_payments")
 
     def tearDown(self):
-        sys.modules.clear()
-        sys.modules.update(self._orig_modules)
+        restore_modules(self._orig_modules)
 
     @staticmethod
     def _basil_invoice_object():
