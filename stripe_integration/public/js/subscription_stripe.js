@@ -22,18 +22,25 @@ frappe.ui.form.on("Subscription", {
     setTimeout(() => { removeLegacyButtons(frm); stripLegacyActionMenuDom(); }, 200);
     setTimeout(() => { removeLegacyButtons(frm); stripLegacyActionMenuDom(); }, 900);
 
-    frm.add_custom_button(__("Stripe: Request Payment Method"), () => requestPaymentMethod(frm));
-    frm.add_custom_button(__("Stripe: Pause"), () => runStripeAction(frm, "pause"));
-    frm.add_custom_button(__("Stripe: Resume"), () => runStripeAction(frm, "resume"));
-    frm.add_custom_button(__("Stripe: Cancel"), () => {
+    addStripeAction(frm, __("Stripe: Request Payment Method"), () => requestPaymentMethod(frm));
+    addStripeAction(frm, __("Stripe: Pause"), () => runStripeAction(frm, "pause"));
+    addStripeAction(frm, __("Stripe: Resume"), () => runStripeAction(frm, "resume"));
+    addStripeAction(frm, __("Stripe: Cancel"), () => {
       frappe.confirm(
         __("Cancel this subscription in Stripe? This cannot be undone."),
         () => runStripeAction(frm, "cancel")
       );
     });
-    frm.add_custom_button(__("Stripe: View Sync Log"), () => showSyncLog(frm));
+    addStripeAction(frm, __("Stripe: View Sync Log"), () => showSyncLog(frm));
   }
 });
+
+
+function addStripeAction(frm, label, handler) {
+  try { frm.remove_custom_button(label); } catch (e) {}
+  try { frm.page.remove_action_item(label); } catch (e) {}
+  frm.page.add_action_item(label, handler);
+}
 
 
 function removeLegacyButtons(frm) {
