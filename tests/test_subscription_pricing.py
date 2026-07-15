@@ -169,6 +169,51 @@ class SubscriptionPricingTests(unittest.TestCase):
 
         self.assertIn("subscription_name=Subscription+With+Space", url)
 
+    def test_non_billing_subscription_skips_automatic_billing_defaults(self):
+        sub = _Obj(
+            submit_invoice=0,
+            generate_invoice_at="End of the current subscription period",
+            custom_do_not_generate_invoices=1,
+            db_set=Mock(),
+        )
+
+        self.module._enforce_subscription_billing_defaults(sub)
+
+        sub.db_set.assert_not_called()
+
+    def test_non_billing_subscription_update_skips_all_stripe_sync(self):
+        sub = _Obj(custom_do_not_generate_invoices=1)
+        self.module._enforce_subscription_billing_defaults = Mock()
+        self.module._is_enabled = Mock(return_value=True)
+
+        self.module.on_subscription_update(sub)
+
+        self.module._enforce_subscription_billing_defaults.assert_called_once_with(sub)
+        self.module._is_enabled.assert_not_called()
+
+    def test_non_billing_subscription_cannot_create_stripe_subscription(self):
+        sub = self.subscription()
+        sub.custom_do_not_generate_invoices = 1
+        original_get_doc = self.module.frappe.get_doc
+        self.module.frappe.get_doc = lambda doctype, name: (
+            sub if doctype == "Subscription" else original_get_doc(doctype, name)
+        )
+
+        class _NullLock:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+        self.module.MariaDBNamedLock = _NullLock
+
+        with self.assertRaisesRegex(Exception, "non-billing"):
+            self.module.ensure_stripe_subscription_for_subscription(sub.name)
+
     def test_existing_customer_default_card_creates_subscription_without_new_setup(self):
         sub = self.subscription()
         sub.update(

@@ -1636,5 +1636,21 @@
     "permlevel": 0,
     "columns": 0,
     "doctype": "Custom Field"
+  },
+  {
+    "name": "Subscription-custom_do_not_generate_invoices",
+    "dt": "Subscription",
+    "label": "Do Not Generate Invoices",
+    "fieldname": "custom_do_not_generate_invoices",
+    "insert_after": "generate_new_invoices_past_due_date",
+    "fieldtype": "Check",
+    "default": "0",
+    "read_only": 1,
+    "no_copy": 1,
+    "allow_on_submit": 1,
+    "in_list_view": 1,
+    "print_hide": 1,
+    "description": "Prevents automatic and manual invoice generation. Use only when the service is fully included in another invoice.",
+    "doctype": "Custom Field"
   }
 ]

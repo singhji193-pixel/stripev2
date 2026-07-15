@@ -46,6 +46,11 @@ SETUP_INTENT_FIELD = "stripe_last_setup_intent_id"
 SETUP_TOKEN_NONCE_FIELD = "stripe_setup_token_nonce"
 
 STABLE_SETUP_ROUTE = "/api/method/stripe_integration.stripe_integration.subscription_sync.open_subscription_setup_link"
+NO_INVOICE_FIELD = "custom_do_not_generate_invoices"
+
+
+def _is_non_billing_subscription(subscription_doc) -> bool:
+    return bool(int(subscription_doc.get(NO_INVOICE_FIELD) or 0))
 
 def _stripe_get(obj, key, default=None):
     if obj is None:
@@ -574,6 +579,10 @@ def _build_stripe_subscription_create_params(sub_doc, stripe_customer_id: str, p
 def ensure_stripe_subscription_for_subscription(subscription_name: str, payment_method: str | None = None, stripe_customer_id: str | None = None):
     with MariaDBNamedLock(f"stripe-subscription-create-{subscription_name}", timeout=30):
         sub_doc = frappe.get_doc("Subscription", subscription_name)
+        if _is_non_billing_subscription(sub_doc):
+            frappe.throw(
+                f"Subscription {subscription_name} is non-billing and cannot be linked to Stripe"
+            )
         if sub_doc.get("stripe_subscription_id"):
             return {
                 "created": False,
@@ -1235,6 +1244,9 @@ def get_subscription_sync_health(hours: int = 24):
     }
 
 def _enforce_subscription_billing_defaults(doc):
+    if _is_non_billing_subscription(doc):
+        return
+
     # Keep ERP subscription invoicing fully automatic.
     # We use db_set so this still works on submitted subscriptions where normal field updates are blocked.
     try:
@@ -1252,6 +1264,9 @@ def _enforce_subscription_billing_defaults(doc):
 
 def on_subscription_update(doc, method=None):
     _enforce_subscription_billing_defaults(doc)
+
+    if _is_non_billing_subscription(doc):
+        return
 
     if not _is_enabled():
         return
