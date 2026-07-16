@@ -12,7 +12,7 @@ doctype_js = {
 }
 
 override_doctype_class = {
-    "Subscription": "stripe_integration.stripe_integration.subscription_override.NonBillingSubscription",
+    "Subscription": "stripe_integration.stripe_integration.subscription_override.StripeManagedSubscription",
 }
 
 
