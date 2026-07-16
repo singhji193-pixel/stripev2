@@ -21,19 +21,59 @@ frappe.ui.form.on("Subscription", {
     stripLegacyActionMenuDom();
     setTimeout(() => { removeLegacyButtons(frm); stripLegacyActionMenuDom(); }, 200);
     setTimeout(() => { removeLegacyButtons(frm); stripLegacyActionMenuDom(); }, 900);
+    removeStripeLifecycleButtons(frm);
 
-    frm.add_custom_button(__("Stripe: Request Payment Method"), () => requestPaymentMethod(frm));
-    frm.add_custom_button(__("Stripe: Pause"), () => runStripeAction(frm, "pause"));
-    frm.add_custom_button(__("Stripe: Resume"), () => runStripeAction(frm, "resume"));
-    frm.add_custom_button(__("Stripe: Cancel"), () => {
-      frappe.confirm(
-        __("Cancel this subscription in Stripe? This cannot be undone."),
-        () => runStripeAction(frm, "cancel")
+    if (frm.is_new() || Number(frm.doc.custom_do_not_generate_invoices || 0)) return;
+
+    addStripeAction(frm, __("Request Payment Method"), () => requestPaymentMethod(frm));
+    if (!frm.doc.stripe_subscription_id) return;
+
+    const canManageLifecycle = ["System Manager", "Accounts Manager"]
+      .some((role) => (frappe.user_roles || []).includes(role));
+    if (canManageLifecycle) {
+      const isPaused = Boolean(
+        Number(frm.doc.stripe_erpnext_pause_active || 0) ||
+        Number(frm.doc.stripe_paused || 0)
       );
-    });
-    frm.add_custom_button(__("Stripe: View Sync Log"), () => showSyncLog(frm));
+      const pauseState = frm.doc.stripe_pause_state || "";
+      if (pauseState === "Pausing") {
+        addStripeAction(frm, __("Retry Pause"), () => runStripeAction(frm, "pause"));
+      } else if (pauseState === "Resuming") {
+        addStripeAction(frm, __("Retry Resume"), () => runStripeAction(frm, "resume"));
+      } else if (pauseState === "Cancelling") {
+        addStripeAction(frm, __("Retry Cancel"), () => runStripeAction(frm, "cancel"));
+      } else if (isPaused) {
+        addStripeAction(frm, __("Resume"), () => confirmResume(frm));
+      } else {
+        addStripeAction(frm, __("Pause"), () => pauseSubscription(frm));
+      }
+      if (pauseState !== "Cancelling") {
+        addStripeAction(frm, __("Cancel"), () => {
+          frappe.confirm(
+            __("Cancel this subscription in Stripe? This cannot be undone."),
+            () => runStripeAction(frm, "cancel")
+          );
+        });
+      }
+    }
+    addStripeAction(frm, __("View Sync Log"), () => showSyncLog(frm));
   }
 });
+
+
+function addStripeAction(frm, label, handler) {
+  const group = __("Stripe");
+  try { frm.remove_custom_button(label, group); } catch (e) {}
+  frm.add_custom_button(label, handler, group);
+}
+
+
+function removeStripeLifecycleButtons(frm) {
+  const group = __("Stripe");
+  [__("Pause"), __("Resume"), __("Cancel"), __("Retry Pause"), __("Retry Resume"), __("Retry Cancel")].forEach((label) => {
+    try { frm.remove_custom_button(label, group); } catch (e) {}
+  });
+}
 
 
 function removeLegacyButtons(frm) {
@@ -110,7 +150,38 @@ function requestPaymentMethod(frm) {
   });
 }
 
-function runStripeAction(frm, action) {
+function pauseSubscription(frm) {
+  const pauseStart = frm.doc.current_invoice_start || __("the next billing period");
+  frappe.prompt(
+    [
+      {
+        fieldname: "pause_cycles",
+        fieldtype: "Int",
+        label: __("Billing Cycles"),
+        default: 1,
+        reqd: 1,
+        description: __(
+          "The hold begins on {0}. Existing invoices are unchanged; the fixed end date is extended by the skipped cycles.",
+          [pauseStart]
+        )
+      }
+    ],
+    (values) => runStripeAction(frm, "pause", { pause_cycles: values.pause_cycles }),
+    __("Pause Subscription Billing"),
+    __("Pause")
+  );
+}
+
+
+function confirmResume(frm) {
+  frappe.confirm(
+    __("Resume this subscription? Billing will restart on the next aligned billing boundary."),
+    () => runStripeAction(frm, "resume")
+  );
+}
+
+
+function runStripeAction(frm, action, extraArgs = {}) {
   if (!frm.doc.stripe_subscription_id) {
     frappe.msgprint({
       title: __("Missing Stripe Subscription ID"),
@@ -122,16 +193,22 @@ function runStripeAction(frm, action) {
 
   frappe.call({
     method: "stripe_integration.stripe_integration.subscription_sync.sync_subscription_action",
-    args: {
+    args: Object.assign({
       subscription_name: frm.doc.name,
       action
-    },
+    }, extraArgs),
     freeze: true,
     freeze_message: __("Syncing subscription with Stripe..."),
     callback: (r) => {
       const out = r.message || {};
       if (out.handled) {
-        frappe.show_alert({ message: __("Stripe sync completed: {0}", [action]), indicator: "green" });
+        const boundary = out.resume_on ? ` (${out.resume_on})` : "";
+        frappe.show_alert({
+          message: out.scheduled
+            ? __("Stripe resume scheduled for {0}.", [out.resume_on])
+            : __("Stripe sync completed: {0}{1}", [action, boundary]),
+          indicator: "green"
+        });
       } else {
         frappe.msgprint({
           title: __("Stripe Sync Not Applied"),

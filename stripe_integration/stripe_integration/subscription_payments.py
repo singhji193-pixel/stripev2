@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 import frappe
 import stripe
-from frappe.utils import flt, nowdate
+from frappe.utils import flt, getdate, nowdate
 
 from stripe_integration.stripe_integration.accounting import (
     MariaDBNamedLock,
@@ -11,6 +11,11 @@ from stripe_integration.stripe_integration.accounting import (
 )
 from stripe_integration.stripe_integration.stripe_fees import ensure_fee_posted
 from stripe_integration.stripe_integration.utils import get_api_key, get_company_abbr_from_company
+
+ACTION_LOCK_FLAG = "stripe_subscription_action_lock_held"
+RECONCILIATION_FLAG = "stripe_allow_pre_pause_reconciliation"
+PAUSE_ACTIVE_FIELD = "stripe_erpnext_pause_active"
+PAUSE_START_FIELD = "stripe_pause_start"
 
 
 def _stripe_get(obj, key, default=None):
@@ -148,6 +153,21 @@ def _link_sales_invoice_to_stripe(si_name: str, stripe_invoice_id: str | None, s
 
 
 def _ensure_sales_invoice_for_subscription_payment(subscription_name: str, obj: dict, stripe_invoice_id: str | None, stripe_pi_id: str | None):
+    with MariaDBNamedLock(f"stripe-subscription-action-{subscription_name}", timeout=30):
+        return _ensure_sales_invoice_for_subscription_payment_locked(
+            subscription_name,
+            obj,
+            stripe_invoice_id,
+            stripe_pi_id,
+        )
+
+
+def _ensure_sales_invoice_for_subscription_payment_locked(
+    subscription_name: str,
+    obj: dict,
+    stripe_invoice_id: str | None,
+    stripe_pi_id: str | None,
+):
     sub = frappe.get_doc("Subscription", subscription_name)
     if stripe_invoice_id and frappe.get_meta("Sales Invoice").get_field("stripe_invoice_id"):
         matched = frappe.db.get_value("Sales Invoice", {"subscription": subscription_name, "stripe_invoice_id": stripe_invoice_id}, "name")
@@ -177,7 +197,34 @@ def _ensure_sales_invoice_for_subscription_payment(subscription_name: str, obj: 
         if obj.get("created")
         else nowdate()
     )
-    si = sub.generate_invoice(from_date=from_date or sub.get("current_invoice_start"), to_date=to_date or sub.get("current_invoice_end"), posting_date=posting_date)
+    invoice_from = from_date or sub.get("current_invoice_start")
+    invoice_to = to_date or sub.get("current_invoice_end")
+    pause_start = sub.get(PAUSE_START_FIELD)
+    if int(sub.get(PAUSE_ACTIVE_FIELD) or 0) and (
+        not invoice_to or not pause_start or getdate(invoice_to) >= getdate(pause_start)
+    ):
+        frappe.throw(
+            f"Subscription {subscription_name}: Stripe invoice period intersects the coordinated billing pause"
+        )
+
+    setattr(sub.flags, ACTION_LOCK_FLAG, True)
+    setattr(sub.flags, RECONCILIATION_FLAG, True)
+    original_period = (sub.get("current_invoice_start"), sub.get("current_invoice_end"))
+    try:
+        # ERPNext prices and deferred-service dates from the Subscription's current
+        # period, not from create_invoice(from_date/to_date). Use the trusted Stripe
+        # period snapshot while reconstructing a delayed pre-pause invoice.
+        sub.current_invoice_start = invoice_from
+        sub.current_invoice_end = invoice_to
+        si = sub.generate_invoice(
+            from_date=invoice_from,
+            to_date=invoice_to,
+            posting_date=posting_date,
+        )
+    finally:
+        sub.current_invoice_start, sub.current_invoice_end = original_period
+        setattr(sub.flags, RECONCILIATION_FLAG, False)
+        setattr(sub.flags, ACTION_LOCK_FLAG, False)
     _link_sales_invoice_to_stripe(si.name, stripe_invoice_id, stripe_pi_id)
     frappe.db.commit()
     return si.name

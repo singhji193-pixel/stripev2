@@ -1,5 +1,7 @@
 import frappe
 
+from stripe_integration.stripe_integration.subscription_pause import COORDINATED_PAUSE_FIELDS
+
 REQUIRED_TEMPLATES = [
     "Stripe CoreOrbit Add Payment Method",
     "Stripe CoreOrbit Subscription Started",
@@ -33,6 +35,7 @@ REQUIRED_SUB_FIELDS = [
     "stripe_setup_link_status",
     "stripe_default_payment_method_id",
     "stripe_last_setup_intent_id",
+    *COORDINATED_PAUSE_FIELDS,
 ]
 
 

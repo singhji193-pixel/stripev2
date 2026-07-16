@@ -39,6 +39,7 @@ GitHub Actions runs the same suite for pushes and pull requests targeting `main`
 ## Operations
 
 - [Production observability](docs/production-observability.md)
+- [Production deployment tool and runbook](ops/production/README.md)
 - Review `Stripe Event Log` and the hourly reconciliation result before correcting accounting data.
 - Manual Stripe payouts are flagged for review because Stripe does not expose their full component balance transactions. Automatic payout Journal Entries post only after every component is matched.
 

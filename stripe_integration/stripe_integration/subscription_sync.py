@@ -14,6 +14,32 @@ from frappe.utils import get_system_timezone, get_url, getdate, nowdate
 
 from stripe_integration.stripe_integration.accounting import MariaDBNamedLock
 from stripe_integration.stripe_integration.event_log import mark_event_status, upsert_event
+from stripe_integration.stripe_integration.subscription_pause import (
+    CADENCE_SNAPSHOT_FIELD,
+    COORDINATED_PAUSE_FIELDS,
+    OPERATION_ATTEMPT_FIELD,
+    PAUSE_ACTIVE_FIELD,
+    PAUSE_CYCLES_FIELD,
+    PAUSE_LAST_RECONCILED_AT_FIELD,
+    PAUSE_OPERATION_FIELD,
+    PAUSE_START_AT_FIELD,
+    PAUSE_START_FIELD,
+    PAUSE_STATE_FIELD,
+    PENDING_RESUME_AT_FIELD,
+    PENDING_RESUME_FIELD,
+    RESUME_AT_FIELD,
+    RESUME_CANCEL_BEFORE_START_FIELD,
+    RESUME_ON_FIELD,
+    STATE_CANCELLING,
+    STATE_PAUSED,
+    STATE_PAUSING,
+    STATE_RESUMING,
+    advance_billing_timestamp,
+    build_pause_window,
+    build_resume_target,
+    build_stripe_cadence_snapshot,
+    load_cadence_snapshot,
+)
 from stripe_integration.stripe_integration.utils import get_api_key, get_company_abbr_from_company
 
 LIFECYCLE_TEMPLATE_MAP = {
@@ -35,6 +61,7 @@ LIFECYCLE_TEMPLATE_MAP = {
 
 ALLOWED_COMPANY_ABBR = {"COE", "COSL"}
 VALID_ACTIONS = {"pause", "resume", "cancel", "plan_change"}
+TERMINAL_STRIPE_STATUSES = {"canceled", "cancelled", "incomplete_expired"}
 
 SETUP_URL_FIELD = "stripe_setup_checkout_url"
 SETUP_SESSION_FIELD = "stripe_setup_session_id"
@@ -46,6 +73,11 @@ SETUP_INTENT_FIELD = "stripe_last_setup_intent_id"
 SETUP_TOKEN_NONCE_FIELD = "stripe_setup_token_nonce"
 
 STABLE_SETUP_ROUTE = "/api/method/stripe_integration.stripe_integration.subscription_sync.open_subscription_setup_link"
+NO_INVOICE_FIELD = "custom_do_not_generate_invoices"
+
+
+def _is_non_billing_subscription(subscription_doc) -> bool:
+    return bool(int(subscription_doc.get(NO_INVOICE_FIELD) or 0))
 
 def _stripe_get(obj, key, default=None):
     if obj is None:
@@ -164,35 +196,305 @@ def _require_subscription_action_role():
         frappe.throw("Not permitted", frappe.PermissionError)
 
 
-def _event_stub(subscription_doc, action: str):
+def _assert_remote_subscription_ownership(
+    subscription_doc,
+    remote,
+    company_abbr: str,
+    *,
+    expected_subscription_id: str | None = None,
+):
+    expected_id = str(
+        expected_subscription_id
+        or subscription_doc.get("stripe_subscription_id")
+        or ""
+    ).strip()
+    remote_id = str(_stripe_get(remote, "id") or "").strip()
+    if not expected_id or remote_id != expected_id:
+        frappe.throw(
+            f"Stripe returned subscription {remote_id or '[missing]'} instead of {expected_id or '[missing]'}"
+        )
+
+    metadata = _stripe_get(remote, "metadata") or {}
+    if str(_stripe_get(metadata, "doctype") or "").strip() != "Subscription":
+        frappe.throw("Stripe subscription ownership metadata is missing doctype=Subscription")
+    if str(_stripe_get(metadata, "docname") or "").strip() != str(subscription_doc.name):
+        frappe.throw("Stripe subscription belongs to a different ERPNext Subscription")
+
+    local_company = str(subscription_doc.get("company") or "").strip()
+    metadata_company = str(_stripe_get(metadata, "company") or "").strip()
+    if not metadata_company or metadata_company != local_company:
+        frappe.throw("Stripe subscription belongs to a different ERPNext company")
+
+    metadata_company_abbr = str(_stripe_get(metadata, "company_abbr") or "").strip().upper()
+    if not metadata_company_abbr or metadata_company_abbr != str(company_abbr or "").strip().upper():
+        frappe.throw("Stripe subscription belongs to a different Stripe company account")
+
+    local_customer = str(subscription_doc.get("stripe_customer_id") or "").strip()
+    if local_customer:
+        remote_customer = _stripe_get(remote, "customer")
+        remote_customer_id = str(_stripe_get(remote_customer, "id") or remote_customer or "").strip()
+        if remote_customer_id != local_customer:
+            frappe.throw("Stripe subscription belongs to a different Stripe customer")
+
+    return remote
+
+
+def _retrieve_owned_subscription(
+    subscription_doc,
+    company_abbr: str,
+    api_key: str,
+    *,
+    expected_subscription_id: str | None = None,
+):
+    subscription_id = expected_subscription_id or subscription_doc.get("stripe_subscription_id")
+    remote = stripe.Subscription.retrieve(subscription_id, api_key=api_key)
+    return _assert_remote_subscription_ownership(
+        subscription_doc,
+        remote,
+        company_abbr,
+        expected_subscription_id=subscription_id,
+    )
+
+
+def _event_stub(subscription_doc, action: str, operation_id: str | None = None):
+    event_key = operation_id or f"{action}_{secrets.token_hex(12)}"
     return {
-        "id": f"local_outbound_{subscription_doc.name}_{action}",
+        "id": f"local_outbound_{subscription_doc.name}_{event_key}",
         "type": f"subscription.{action}",
         "data": {"object": {"id": getattr(subscription_doc, "stripe_subscription_id", None)}},
     }
 
 
-def _validate_transition(stripe_sub_id: str, action: str, company_abbr: str):
-    if action not in {"pause", "resume"}:
-        return True, None
+def _new_operation_id(action: str) -> str:
+    return f"{action}_{secrets.token_hex(12)}"
 
-    remote = stripe.Subscription.retrieve(
-        stripe_sub_id,
-        api_key=get_api_key(company_abbr),
+
+def _require_coordinated_pause_fields() -> None:
+    meta = frappe.get_meta("Subscription")
+    missing = [fieldname for fieldname in COORDINATED_PAUSE_FIELDS if not meta.get_field(fieldname)]
+    if missing:
+        frappe.throw(
+            "Subscription pause migration is incomplete; missing fields: " + ", ".join(missing)
+        )
+
+
+def _remote_pause_collection(remote):
+    return _stripe_get(remote, "pause_collection") or None
+
+
+def _utc_now_timestamp() -> int:
+    return int(datetime.now(timezone.utc).timestamp())
+
+
+def _remote_pause_is_active(remote) -> bool:
+    pause_collection = _remote_pause_collection(remote)
+    if not pause_collection:
+        return False
+    resumes_at = int(_stripe_get(pause_collection, "resumes_at") or 0)
+    return not resumes_at or resumes_at > _utc_now_timestamp()
+
+
+def _pause_collection_matches(pause_collection, expected_resume: int) -> bool:
+    return bool(
+        pause_collection
+        and str(_stripe_get(pause_collection, "behavior") or "").strip().lower() == "void"
+        and int(_stripe_get(pause_collection, "resumes_at") or 0) == int(expected_resume)
     )
-    paused = bool(getattr(remote, "pause_collection", None))
 
-    if action == "pause" and paused:
-        return False, "already_paused"
-    if action == "resume" and not paused:
-        return False, "not_paused"
-    return True, None
+
+def _remote_subscription_status(remote) -> str:
+    return str(_stripe_get(remote, "status") or "").strip().lower()
+
+
+def _coordinated_pause_requires_cadence(subscription_doc) -> bool:
+    state = str(subscription_doc.get(PAUSE_STATE_FIELD) or "").strip()
+    return bool(
+        int(subscription_doc.get(PAUSE_ACTIVE_FIELD) or 0)
+        and state != STATE_CANCELLING
+    )
+
+
+def _remote_period_end_timestamp(remote) -> int | None:
+    timestamp = _stripe_get(remote, "current_period_end")
+    if timestamp:
+        return int(timestamp)
+    items = _stripe_get(_stripe_get(remote, "items") or {}, "data") or []
+    if items:
+        timestamp = _stripe_get(items[0], "current_period_end")
+    return int(timestamp) if timestamp else None
+
+
+def _require_supported_remote_cadence(remote, subscription_doc=None) -> None:
+    billing_mode = _stripe_get(remote, "billing_mode")
+    billing_mode_type = (
+        _stripe_get(billing_mode, "type")
+        if billing_mode and not isinstance(billing_mode, str)
+        else billing_mode
+    )
+    if str(billing_mode_type or "").strip().lower() == "flexible":
+        frappe.throw("Stripe flexible billing is not supported for coordinated pauses")
+
+    for fieldname, label in (
+        ("schedule", "a subscription schedule"),
+        ("pending_update", "a pending update"),
+        ("billing_thresholds", "subscription billing thresholds"),
+    ):
+        if _stripe_get(remote, fieldname) is not None:
+            frappe.throw(
+                f"Stripe {label} creates unsupported dynamic cadence for coordinated pauses"
+            )
+
+    items = _stripe_get(_stripe_get(remote, "items") or {}, "data") or []
+    cadences = set()
+    for item in items:
+        if _stripe_get(item, "billing_thresholds") is not None:
+            frappe.throw(
+                "Stripe item billing thresholds create unsupported dynamic cadence "
+                "for coordinated pauses"
+            )
+        price = _stripe_get(item, "price") or {}
+        recurring = _stripe_get(price, "recurring") or _stripe_get(item, "plan") or {}
+        if str(_stripe_get(recurring, "usage_type") or "").strip().lower() == "metered":
+            frappe.throw(
+                "Stripe metered usage creates unsupported dynamic cadence for coordinated pauses"
+            )
+        interval = str(_stripe_get(recurring, "interval") or "").strip().lower()
+        if interval:
+            cadences.add((interval, int(_stripe_get(recurring, "interval_count") or 1)))
+
+    if not items:
+        plan = _stripe_get(remote, "plan") or {}
+        if str(_stripe_get(plan, "usage_type") or "").strip().lower() == "metered":
+            frappe.throw(
+                "Stripe metered usage creates unsupported dynamic cadence for coordinated pauses"
+            )
+        interval = str(_stripe_get(plan, "interval") or "").strip().lower()
+        if interval:
+            cadences.add((interval, int(_stripe_get(plan, "interval_count") or 1)))
+
+    item_periods = {
+        (
+            _stripe_get(item, "current_period_start"),
+            _stripe_get(item, "current_period_end"),
+        )
+        for item in items
+    }
+    if len(item_periods) > 1:
+        frappe.throw("Stripe subscription items must expose one shared billing period")
+
+    cadence_snapshot = load_cadence_snapshot(subscription_doc) if subscription_doc else None
+    if cadence_snapshot:
+        remote_anchor = int(_stripe_get(remote, "billing_cycle_anchor") or 0)
+        expected_cadence = {
+            (
+                cadence_snapshot["interval"],
+                int(cadence_snapshot["interval_count"]),
+            )
+        }
+        if (
+            remote_anchor != int(cadence_snapshot["billing_cycle_anchor"])
+            or cadences != expected_cadence
+        ):
+            frappe.throw(
+                "Stripe billing cadence changed after the coordinated pause was admitted"
+            )
+
+
+def _validate_cadence_for_status_sync(subscription_doc, remote) -> None:
+    if (
+        _remote_subscription_status(remote) not in TERMINAL_STRIPE_STATUSES
+        and _coordinated_pause_requires_cadence(subscription_doc)
+    ):
+        _require_supported_remote_cadence(remote, subscription_doc)
+
+
+def _utc_date_from_timestamp(timestamp: int):
+    return datetime.fromtimestamp(int(timestamp), tz=timezone.utc).date()
+
+
+def _require_remote_pause_boundary(remote, pause_start, expected_timestamp: int | None = None) -> int:
+    timestamp = _remote_period_end_timestamp(remote)
+    if not timestamp:
+        frappe.throw("Stripe subscription does not expose a verifiable next billing boundary")
+    if expected_timestamp and int(timestamp) != int(expected_timestamp):
+        frappe.throw(
+            f"Stripe next billing timestamp {timestamp} does not match the persisted anchor {expected_timestamp}"
+        )
+    remote_boundary = _utc_date_from_timestamp(timestamp)
+    if remote_boundary != getdate(pause_start):
+        frappe.throw(
+            f"Stripe next billing boundary {remote_boundary} does not match ERPNext {getdate(pause_start)}"
+        )
+    return int(timestamp)
+
+
+def retrieve_subscription_pause_state(subscription_doc) -> dict:
+    company_abbr = _validate_company_for_stripe(subscription_doc.company)
+    api_key = get_api_key(company_abbr)
+    remote = _retrieve_owned_subscription(
+        subscription_doc,
+        company_abbr,
+        api_key,
+    )
+    remote_status = _remote_subscription_status(remote)
+    paused = _remote_pause_is_active(remote)
+    if remote_status not in TERMINAL_STRIPE_STATUSES:
+        _require_supported_remote_cadence(remote, subscription_doc)
+        if not paused:
+            _assert_due_resume_is_unbilled(subscription_doc, remote, api_key)
+    return {
+        "remote": remote,
+        "paused": paused,
+        "company_abbr": company_abbr,
+    }
+
+
+def _update_doc_values(subscription_doc, values: dict) -> None:
+    if hasattr(subscription_doc, "update"):
+        subscription_doc.update(values)
+        return
+    for fieldname, value in values.items():
+        setattr(subscription_doc, fieldname, value)
+
+
+def _persist_operation_intent(subscription_doc, event: dict, company_abbr: str, values: dict) -> None:
+    upsert_event(
+        event,
+        payload=json.dumps(event).encode(),
+        company_abbr=company_abbr,
+        status="Processing",
+    )
+    _set_subscription_fields(subscription_doc.name, values, required=COORDINATED_PAUSE_FIELDS)
+    _update_doc_values(subscription_doc, values)
+
+
+def _next_operation_attempt(subscription_doc) -> int:
+    attempt = int(subscription_doc.get(OPERATION_ATTEMPT_FIELD) or 0) + 1
+    values = {OPERATION_ATTEMPT_FIELD: attempt}
+    _set_subscription_fields(
+        subscription_doc.name,
+        values,
+        required=COORDINATED_PAUSE_FIELDS,
+    )
+    _update_doc_values(subscription_doc, values)
+    return attempt
+
+
+def _operation_idempotency_key(subscription_doc, operation_id: str, attempt: int) -> str:
+    return f"erpnext-{subscription_doc.name}-{operation_id}-{int(attempt)}"
+
+
+def _finish_operation(event_id: str, status: str, error: str | None = None) -> None:
+    mark_event_status(event_id, status, error)
+    frappe.db.commit()
 
 
 def _sync_subscription_plan(subscription_doc, stripe_sub_id: str, company_abbr: str):
-    remote = stripe.Subscription.retrieve(
-        stripe_sub_id,
-        api_key=get_api_key(company_abbr),
+    remote = _retrieve_owned_subscription(
+        subscription_doc,
+        company_abbr,
+        get_api_key(company_abbr),
+        expected_subscription_id=stripe_sub_id,
     )
     existing_items = _stripe_get(_stripe_get(remote, "items") or {}, "data") or []
     desired_items = _build_stripe_subscription_items(subscription_doc)
@@ -222,6 +524,12 @@ def _sync_subscription_plan(subscription_doc, stripe_sub_id: str, company_abbr: 
         api_key=get_api_key(company_abbr),
         **params,
     )
+    updated = _assert_remote_subscription_ownership(
+        subscription_doc,
+        updated,
+        company_abbr,
+        expected_subscription_id=stripe_sub_id,
+    )
 
     updated_items = _stripe_get(_stripe_get(updated, "items") or {}, "data") or []
     _set_subscription_fields(
@@ -236,55 +544,757 @@ def _sync_subscription_plan(subscription_doc, stripe_sub_id: str, company_abbr: 
     return updated
 
 
-def _sync_subscription(subscription_doc, action: str):
+def _base_action_result(subscription_doc, action: str, company_abbr: str) -> dict:
+    return {
+        "handled": True,
+        "subscription": subscription_doc.name,
+        "stripe_subscription_id": subscription_doc.stripe_subscription_id,
+        "action": action,
+        "company_abbr": company_abbr,
+    }
+
+
+def _clear_unestablished_pause(subscription_doc, event: dict, company_abbr: str) -> dict:
+    values = {
+        PAUSE_ACTIVE_FIELD: 0,
+        PAUSE_STATE_FIELD: "",
+        PAUSE_OPERATION_FIELD: "",
+        PENDING_RESUME_FIELD: None,
+        PENDING_RESUME_AT_FIELD: "",
+        RESUME_CANCEL_BEFORE_START_FIELD: 0,
+        OPERATION_ATTEMPT_FIELD: 0,
+        PAUSE_CYCLES_FIELD: 0,
+        CADENCE_SNAPSHOT_FIELD: "",
+        PAUSE_LAST_RECONCILED_AT_FIELD: None,
+        "stripe_paused": 0,
+    }
+    _set_subscription_fields(
+        subscription_doc.name,
+        values,
+        required=COORDINATED_PAUSE_FIELDS,
+    )
+    _update_doc_values(subscription_doc, values)
+    _finish_operation(
+        event["id"],
+        "Ignored",
+        "stripe_pause_not_established_before_boundary",
+    )
+    return {
+        **_base_action_result(subscription_doc, "pause", company_abbr),
+        "handled": False,
+        "reason": "stripe_pause_not_established_before_boundary",
+    }
+
+
+def _stripe_invoice_periods(invoice) -> list[tuple[int, int]]:
+    periods = []
+    candidates = [invoice]
+    candidates.extend(
+        _stripe_get(_stripe_get(invoice, "lines") or {}, "data") or []
+    )
+    for candidate in candidates:
+        period = _stripe_get(candidate, "period") or {}
+        start = _stripe_get(period, "start") or _stripe_get(candidate, "period_start")
+        end = _stripe_get(period, "end") or _stripe_get(candidate, "period_end")
+        if start and end:
+            periods.append((int(start), int(end)))
+    return periods
+
+
+def _assert_pause_window_not_billed(
+    subscription_doc,
+    api_key: str,
+    pause_start_at: int,
+    resume_at: int,
+) -> None:
+    invoices = _stripe_list_all(
+        stripe.Invoice,
+        api_key,
+        subscription=subscription_doc.stripe_subscription_id,
+    )
+    for invoice in invoices:
+        periods = _stripe_invoice_periods(invoice)
+        relevant = any(
+            start < int(resume_at) and end > int(pause_start_at)
+            for start, end in periods
+        )
+        if not periods:
+            created = int(_stripe_get(invoice, "created") or 0)
+            relevant = int(pause_start_at) <= created < int(resume_at)
+        if not relevant:
+            continue
+        status = str(_stripe_get(invoice, "status") or "").strip().lower()
+        if status not in {"void", "deleted"}:
+            frappe.throw(
+                "The coordinated Stripe pause period was already billed or charged; "
+                "manual reconciliation is required"
+            )
+
+
+def _assert_due_resume_is_unbilled(subscription_doc, remote, api_key: str) -> None:
+    if not _coordinated_pause_requires_cadence(subscription_doc):
+        return
+
+    resume_field = (
+        PENDING_RESUME_AT_FIELD
+        if subscription_doc.get(PAUSE_STATE_FIELD) == STATE_RESUMING
+        else RESUME_AT_FIELD
+    )
+    pause_start_at = int(subscription_doc.get(PAUSE_START_AT_FIELD) or 0)
+    resume_at = int(subscription_doc.get(resume_field) or 0)
+    if not pause_start_at or not resume_at or resume_at <= pause_start_at:
+        frappe.throw("Persisted Stripe pause window is invalid; manual reconciliation is required")
+    if _utc_now_timestamp() < resume_at:
+        return
+
+    pause_collection = _remote_pause_collection(remote)
+    if pause_collection:
+        behavior = str(_stripe_get(pause_collection, "behavior") or "").strip().lower()
+        remote_resume_at = int(_stripe_get(pause_collection, "resumes_at") or 0)
+        if behavior != "void" or remote_resume_at != resume_at:
+            frappe.throw(
+                "Stripe does not retain the persisted void pause contract; "
+                "manual reconciliation is required"
+            )
+
+    _assert_pause_window_not_billed(
+        subscription_doc,
+        api_key,
+        pause_start_at,
+        resume_at,
+    )
+
+
+def _sync_pause_action(subscription_doc, pause_cycles: int, company_abbr: str, api_key: str):
+    _require_coordinated_pause_fields()
+    local_active = bool(int(subscription_doc.get(PAUSE_ACTIVE_FIELD) or 0))
+    state = subscription_doc.get(PAUSE_STATE_FIELD) or ""
+    remote = None
+
+    if local_active:
+        if state != STATE_PAUSING or not subscription_doc.get(PAUSE_OPERATION_FIELD):
+            return {
+                "handled": False,
+                "reason": "already_paused",
+                "subscription": subscription_doc.name,
+                "action": "pause",
+            }
+        operation_id = subscription_doc.get(PAUSE_OPERATION_FIELD)
+        pause_window = {
+            "billing_cycles": int(subscription_doc.get(PAUSE_CYCLES_FIELD) or 0),
+            "pause_start": str(subscription_doc.get(PAUSE_START_FIELD)),
+            "resume_on": str(subscription_doc.get(RESUME_ON_FIELD)),
+        }
+        anchor_timestamp = int(subscription_doc.get(PAUSE_START_AT_FIELD) or 0)
+        expected_resume = int(subscription_doc.get(RESUME_AT_FIELD) or 0)
+        if not anchor_timestamp or not expected_resume:
+            frappe.throw("Persisted Stripe pause anchors are missing; manual reconciliation is required")
+        event = _event_stub(subscription_doc, "pause", operation_id=operation_id)
+        remote = _retrieve_owned_subscription(subscription_doc, company_abbr, api_key)
+        upsert_event(
+            event,
+            payload=json.dumps(event).encode(),
+            company_abbr=company_abbr,
+            status="Processing",
+        )
+        frappe.db.commit()
+        remote_status = _remote_subscription_status(remote)
+        if remote_status in TERMINAL_STRIPE_STATUSES:
+            canonical_remote = (
+                remote.to_dict_recursive()
+                if hasattr(remote, "to_dict_recursive")
+                else dict(remote)
+            )
+            _apply_subscription_state(subscription_doc.name, canonical_remote)
+            _finish_operation(event["id"], "Ignored", "stripe_subscription_terminal")
+            return {
+                "handled": False,
+                "reason": "stripe_subscription_terminal",
+                "subscription": subscription_doc.name,
+                "action": "pause",
+                "stripe_status": remote_status,
+            }
+        _require_supported_remote_cadence(remote, subscription_doc)
+    else:
+        # Validate the local ERPNext period before making a Stripe request. The
+        # canonical Stripe cadence is then snapshotted and checked across its
+        # recurrence so an incompatible short-month anchor fails closed.
+        pause_window = build_pause_window(subscription_doc, pause_cycles)
+        remote = _retrieve_owned_subscription(subscription_doc, company_abbr, api_key)
+        remote_status = _remote_subscription_status(remote)
+        if remote_status in TERMINAL_STRIPE_STATUSES:
+            canonical_remote = (
+                remote.to_dict_recursive()
+                if hasattr(remote, "to_dict_recursive")
+                else dict(remote)
+            )
+            _apply_subscription_state(subscription_doc.name, canonical_remote)
+            return {
+                "handled": False,
+                "reason": "stripe_subscription_terminal",
+                "subscription": subscription_doc.name,
+                "action": "pause",
+                "stripe_status": remote_status,
+            }
+        _require_supported_remote_cadence(remote)
+        if _remote_pause_is_active(remote):
+            frappe.throw(
+                "Stripe is already paused without an ERPNext coordinated hold; "
+                "manual reconciliation is required"
+            )
+        anchor_timestamp = _require_remote_pause_boundary(remote, pause_window["pause_start"])
+        cadence_snapshot = build_stripe_cadence_snapshot(
+            subscription_doc,
+            remote,
+            pause_start_at=anchor_timestamp,
+        )
+        pause_window = build_pause_window(
+            subscription_doc,
+            pause_cycles,
+            cadence_snapshot=cadence_snapshot,
+            pause_start_at=anchor_timestamp,
+        )
+        anchor_timestamp = pause_window["pause_start_at"]
+        expected_resume = pause_window["resume_at"]
+        if _utc_date_from_timestamp(expected_resume) != getdate(pause_window["resume_on"]):
+            frappe.throw(
+                "Stripe and ERPNext calculate different resume boundaries; billing was not paused"
+            )
+        operation_id = _new_operation_id("pause")
+        event = _event_stub(subscription_doc, "pause", operation_id=operation_id)
+        _persist_operation_intent(
+            subscription_doc,
+            event,
+            company_abbr,
+            {
+                PAUSE_ACTIVE_FIELD: 1,
+                PAUSE_STATE_FIELD: STATE_PAUSING,
+                PAUSE_OPERATION_FIELD: operation_id,
+                PAUSE_START_FIELD: pause_window["pause_start"],
+                RESUME_ON_FIELD: pause_window["resume_on"],
+                PENDING_RESUME_FIELD: None,
+                CADENCE_SNAPSHOT_FIELD: pause_window["cadence_snapshot"],
+                PAUSE_START_AT_FIELD: str(anchor_timestamp),
+                RESUME_AT_FIELD: str(expected_resume),
+                PENDING_RESUME_AT_FIELD: "",
+                RESUME_CANCEL_BEFORE_START_FIELD: 0,
+                OPERATION_ATTEMPT_FIELD: 0,
+                PAUSE_CYCLES_FIELD: pause_window["billing_cycles"],
+                PAUSE_LAST_RECONCILED_AT_FIELD: None,
+            },
+        )
+
+    try:
+        pause_collection = _remote_pause_collection(remote) or {}
+        if pause_collection and not local_active and not _remote_pause_is_active(remote):
+            pause_collection = {}
+        if not _pause_collection_matches(pause_collection, expected_resume):
+            if pause_collection:
+                frappe.throw(
+                    "Stripe has a different pause behavior or boundary; manual reconciliation is required"
+                )
+            pause_intent_active = bool(
+                int(subscription_doc.get(PAUSE_ACTIVE_FIELD) or 0)
+                and subscription_doc.get(PAUSE_STATE_FIELD) == STATE_PAUSING
+            )
+            if pause_intent_active and _utc_now_timestamp() >= anchor_timestamp:
+                return _clear_unestablished_pause(
+                    subscription_doc,
+                    event,
+                    company_abbr,
+                )
+            if local_active:
+                _require_remote_pause_boundary(
+                    remote,
+                    pause_window["pause_start"],
+                    expected_timestamp=anchor_timestamp,
+                )
+                if subscription_doc.is_current_invoice_generated(
+                    pause_window["pause_start"],
+                    subscription_doc.get("current_invoice_end"),
+                ):
+                    frappe.throw(
+                        "The stored pause period is already invoiced; manual reconciliation is required"
+                    )
+            attempt = _next_operation_attempt(subscription_doc)
+            stripe.Subscription.modify(
+                subscription_doc.stripe_subscription_id,
+                pause_collection={"behavior": "void", "resumes_at": expected_resume},
+                api_key=api_key,
+                idempotency_key=_operation_idempotency_key(
+                    subscription_doc,
+                    operation_id,
+                    attempt,
+                ),
+            )
+            remote = _retrieve_owned_subscription(subscription_doc, company_abbr, api_key)
+            _require_supported_remote_cadence(remote, subscription_doc)
+            pause_collection = _remote_pause_collection(remote) or {}
+        if not _pause_collection_matches(pause_collection, expected_resume):
+            if not pause_collection and _utc_now_timestamp() >= anchor_timestamp:
+                return _clear_unestablished_pause(
+                    subscription_doc,
+                    event,
+                    company_abbr,
+                )
+            frappe.throw("Stripe did not retain the requested void pause and resume boundary")
+
+        _assert_pause_window_not_billed(
+            subscription_doc,
+            api_key,
+            anchor_timestamp,
+            expected_resume,
+        )
+
+        completed_values = {
+            PAUSE_STATE_FIELD: STATE_PAUSED,
+            OPERATION_ATTEMPT_FIELD: 0,
+            "stripe_paused": 1,
+        }
+        _set_subscription_fields(
+            subscription_doc.name,
+            completed_values,
+            required=COORDINATED_PAUSE_FIELDS,
+            update_modified=True,
+        )
+        _update_doc_values(subscription_doc, completed_values)
+        _finish_operation(event["id"], "Completed")
+    except Exception as exc:
+        frappe.db.rollback()
+        _finish_operation(event["id"], "Failed", str(exc))
+        raise
+
+    result = _base_action_result(subscription_doc, "pause", company_abbr)
+    result.update(pause_window)
+    return result
+
+
+def _complete_due_resume(subscription_doc, target):
+    if not hasattr(subscription_doc, "complete_billing_pause") or not hasattr(
+        subscription_doc, "_process_subscription"
+    ):
+        frappe.throw("Subscription override is unavailable; ERPNext billing remains paused")
+
+    subscription_doc.complete_billing_pause()
+    lock_flag_setter = getattr(subscription_doc, "_set_lock_flag", None)
+    if lock_flag_setter:
+        lock_flag_setter(True)
+    try:
+        # Use the native processing path so a generated resume-period invoice is
+        # followed by the same period advance, end-date, and status handling as
+        # ERPNext's scheduler.
+        subscription_doc._process_subscription(target)
+    finally:
+        if lock_flag_setter:
+            lock_flag_setter(False)
+
+
+def _sync_resume_action(subscription_doc, company_abbr: str, api_key: str):
+    _require_coordinated_pause_fields()
+    local_active = bool(int(subscription_doc.get(PAUSE_ACTIVE_FIELD) or 0))
+    state = subscription_doc.get(PAUSE_STATE_FIELD) or ""
+    if state == STATE_CANCELLING:
+        return _sync_cancel_action(subscription_doc, company_abbr, api_key)
+    if state == STATE_PAUSING:
+        frappe.throw("Complete or retry the pending Stripe pause before resuming billing")
+    remote = _retrieve_owned_subscription(subscription_doc, company_abbr, api_key)
+    remote_status = _remote_subscription_status(remote)
+    if remote_status in TERMINAL_STRIPE_STATUSES:
+        canonical_remote = (
+            remote.to_dict_recursive()
+            if hasattr(remote, "to_dict_recursive")
+            else dict(remote)
+        )
+        _apply_subscription_state(subscription_doc.name, canonical_remote)
+        return {
+            "handled": False,
+            "reason": "stripe_subscription_terminal",
+            "subscription": subscription_doc.name,
+            "action": "resume",
+            "stripe_status": remote_status,
+        }
+    _require_supported_remote_cadence(remote, subscription_doc)
+    remote_paused = _remote_pause_is_active(remote)
+    remote_pause_collection = _remote_pause_collection(remote)
+    if local_active and remote_pause_collection and str(
+        _stripe_get(remote_pause_collection, "behavior") or ""
+    ).strip().lower() != "void":
+        frappe.throw("Stripe pause behavior is not void; manual reconciliation is required")
+
+    if state == STATE_RESUMING and subscription_doc.get(PAUSE_OPERATION_FIELD):
+        operation_id = subscription_doc.get(PAUSE_OPERATION_FIELD)
+        pending_resume = subscription_doc.get(PENDING_RESUME_FIELD)
+        target = str(pending_resume) if pending_resume else None
+        target_timestamp = int(subscription_doc.get(PENDING_RESUME_AT_FIELD) or 0) or None
+        cycles = int(subscription_doc.get(PAUSE_CYCLES_FIELD) or 0)
+        cancel_before_start = bool(
+            int(subscription_doc.get(RESUME_CANCEL_BEFORE_START_FIELD) or 0)
+        )
+        event = _event_stub(subscription_doc, "resume", operation_id=operation_id)
+        upsert_event(
+            event,
+            payload=json.dumps(event).encode(),
+            company_abbr=company_abbr,
+            status="Processing",
+        )
+        frappe.db.commit()
+    else:
+        if not local_active and not remote_paused:
+            if int(subscription_doc.get("stripe_paused") or 0):
+                _set_subscription_fields(subscription_doc.name, {"stripe_paused": 0})
+                return {
+                    **_base_action_result(subscription_doc, "resume", company_abbr),
+                    "recovered_stale_state": True,
+                }
+            return {
+                "handled": False,
+                "reason": "not_paused",
+                "subscription": subscription_doc.name,
+                "action": "resume",
+            }
+
+        resume_target = (
+            build_resume_target(
+                subscription_doc,
+                current_timestamp=_utc_now_timestamp(),
+            )
+            if local_active
+            else None
+        )
+        target = resume_target["resume_on"] if resume_target else None
+        cycles = int(resume_target["billing_cycles"] if resume_target else 0)
+        cancel_before_start = bool(resume_target and resume_target["cancel_before_start"])
+        target_timestamp = None
+        if local_active:
+            anchor_timestamp = int(subscription_doc.get(PAUSE_START_AT_FIELD) or 0)
+            if not anchor_timestamp:
+                frappe.throw("Persisted Stripe pause anchor is missing; manual reconciliation is required")
+            target_timestamp = int(resume_target.get("resume_at") or 0) or None
+            if not target_timestamp:
+                target_timestamp = advance_billing_timestamp(
+                    subscription_doc,
+                    anchor_timestamp,
+                    cycles,
+                )
+            if _utc_date_from_timestamp(target_timestamp) != getdate(target):
+                frappe.throw(
+                    "Stripe and ERPNext calculate different resume boundaries; billing remains paused"
+                )
+        operation_id = _new_operation_id("resume")
+        event = _event_stub(subscription_doc, "resume", operation_id=operation_id)
+        intent_values = {
+            PAUSE_STATE_FIELD: STATE_RESUMING,
+            PAUSE_OPERATION_FIELD: operation_id,
+            PENDING_RESUME_FIELD: target,
+            PENDING_RESUME_AT_FIELD: str(target_timestamp) if target_timestamp else "",
+            RESUME_CANCEL_BEFORE_START_FIELD: 1 if cancel_before_start else 0,
+            OPERATION_ATTEMPT_FIELD: 0,
+        }
+        if local_active:
+            intent_values[PAUSE_CYCLES_FIELD] = cycles
+        _persist_operation_intent(
+            subscription_doc,
+            event,
+            company_abbr,
+            intent_values,
+        )
+
+    try:
+        if local_active and not target_timestamp:
+            frappe.throw("Pending Stripe resume anchor is missing; billing remains paused")
+        resume_boundary_passed = bool(
+            local_active
+            and target_timestamp
+            and int(target_timestamp) <= _utc_now_timestamp()
+        )
+        clear_immediately = not local_active or cancel_before_start or resume_boundary_passed
+        if clear_immediately:
+            if resume_boundary_passed and remote_paused:
+                frappe.throw(
+                    "The requested resume boundary passed while Stripe remained paused; "
+                    "manual reconciliation is required"
+                )
+            if remote_paused:
+                attempt = _next_operation_attempt(subscription_doc)
+                stripe.Subscription.modify(
+                    subscription_doc.stripe_subscription_id,
+                    pause_collection="",
+                    api_key=api_key,
+                    idempotency_key=_operation_idempotency_key(
+                        subscription_doc,
+                        operation_id,
+                        attempt,
+                    ),
+                )
+                remote = _retrieve_owned_subscription(subscription_doc, company_abbr, api_key)
+                _require_supported_remote_cadence(remote, subscription_doc)
+                remote_paused = _remote_pause_is_active(remote)
+            if remote_paused:
+                frappe.throw("Stripe subscription is still paused after the resume request")
+        elif remote_paused:
+            expected_resume = int(target_timestamp)
+            pause_collection = _remote_pause_collection(remote) or {}
+            if str(_stripe_get(pause_collection, "behavior") or "").strip().lower() != "void":
+                frappe.throw("Stripe pause behavior is not void; manual reconciliation is required")
+            if int(_stripe_get(pause_collection, "resumes_at") or 0) != expected_resume:
+                attempt = _next_operation_attempt(subscription_doc)
+                stripe.Subscription.modify(
+                    subscription_doc.stripe_subscription_id,
+                    pause_collection={"behavior": "void", "resumes_at": expected_resume},
+                    api_key=api_key,
+                    idempotency_key=_operation_idempotency_key(
+                        subscription_doc,
+                        operation_id,
+                        attempt,
+                    ),
+                )
+                remote = _retrieve_owned_subscription(subscription_doc, company_abbr, api_key)
+                _require_supported_remote_cadence(remote, subscription_doc)
+                pause_collection = _remote_pause_collection(remote) or {}
+            if not _pause_collection_matches(pause_collection, expected_resume):
+                frappe.throw("Stripe did not retain the requested void pause and resume boundary")
+
+        if local_active and resume_boundary_passed:
+            _assert_due_resume_is_unbilled(subscription_doc, remote, api_key)
+
+        if not local_active or (cancel_before_start and not resume_boundary_passed):
+            completed_values = {
+                PAUSE_ACTIVE_FIELD: 0,
+                PAUSE_STATE_FIELD: "",
+                PAUSE_OPERATION_FIELD: "",
+                PENDING_RESUME_FIELD: None,
+                PENDING_RESUME_AT_FIELD: "",
+                RESUME_CANCEL_BEFORE_START_FIELD: 0,
+                OPERATION_ATTEMPT_FIELD: 0,
+                PAUSE_CYCLES_FIELD: 0,
+                CADENCE_SNAPSHOT_FIELD: "",
+                PAUSE_LAST_RECONCILED_AT_FIELD: None,
+                "stripe_paused": 0,
+            }
+        elif clear_immediately:
+            _complete_due_resume(subscription_doc, target)
+            completed_values = {
+                PAUSE_ACTIVE_FIELD: 0,
+                RESUME_ON_FIELD: target,
+                RESUME_AT_FIELD: str(target_timestamp) if target_timestamp else "",
+                PAUSE_STATE_FIELD: "",
+                PAUSE_OPERATION_FIELD: "",
+                PENDING_RESUME_FIELD: None,
+                PENDING_RESUME_AT_FIELD: "",
+                RESUME_CANCEL_BEFORE_START_FIELD: 0,
+                OPERATION_ATTEMPT_FIELD: 0,
+                PAUSE_CYCLES_FIELD: 0,
+                CADENCE_SNAPSHOT_FIELD: "",
+                PAUSE_LAST_RECONCILED_AT_FIELD: None,
+                "stripe_paused": 0,
+            }
+        else:
+            completed_values = {
+                RESUME_ON_FIELD: target,
+                RESUME_AT_FIELD: str(target_timestamp) if target_timestamp else "",
+                PAUSE_STATE_FIELD: STATE_PAUSED,
+                PAUSE_OPERATION_FIELD: "",
+                PENDING_RESUME_FIELD: None,
+                PENDING_RESUME_AT_FIELD: "",
+                RESUME_CANCEL_BEFORE_START_FIELD: 0,
+                OPERATION_ATTEMPT_FIELD: 0,
+                PAUSE_CYCLES_FIELD: cycles,
+                "stripe_paused": 1 if remote_paused else 0,
+            }
+        _set_subscription_fields(
+            subscription_doc.name,
+            completed_values,
+            required=COORDINATED_PAUSE_FIELDS,
+        )
+        _update_doc_values(subscription_doc, completed_values)
+        _finish_operation(event["id"], "Completed")
+    except Exception as exc:
+        frappe.db.rollback()
+        _finish_operation(event["id"], "Failed", str(exc))
+        raise
+
+    result = _base_action_result(subscription_doc, "resume", company_abbr)
+    if target:
+        result["resume_on"] = target
+        result["scheduled"] = bool(
+            local_active
+            and not cancel_before_start
+            and target_timestamp
+            and int(target_timestamp) > _utc_now_timestamp()
+        )
+    return result
+
+
+def _stripe_resource_is_missing(exc: Exception) -> bool:
+    return (
+        str(_stripe_get(exc, "code") or "").strip().lower() == "resource_missing"
+        or "no such subscription" in str(exc).lower()
+    )
+
+
+def _sync_cancel_action(subscription_doc, company_abbr: str, api_key: str):
+    _require_coordinated_pause_fields()
+    state = subscription_doc.get(PAUSE_STATE_FIELD) or ""
+    operation_id = subscription_doc.get(PAUSE_OPERATION_FIELD)
+
+    try:
+        initial_remote = _retrieve_owned_subscription(
+            subscription_doc,
+            company_abbr,
+            api_key,
+        )
+    except Exception as exc:
+        if _stripe_resource_is_missing(exc):
+            frappe.throw(
+                "Stripe subscription was not found with the configured company account; "
+                "cancellation was not confirmed"
+            )
+        raise
+
+    if state == STATE_CANCELLING and operation_id:
+        event = _event_stub(subscription_doc, "cancel", operation_id=operation_id)
+        upsert_event(
+            event,
+            payload=json.dumps(event).encode(),
+            company_abbr=company_abbr,
+            status="Processing",
+        )
+        frappe.db.commit()
+    else:
+        operation_id = _new_operation_id("cancel")
+        event = _event_stub(subscription_doc, "cancel", operation_id=operation_id)
+        _persist_operation_intent(
+            subscription_doc,
+            event,
+            company_abbr,
+            {
+                PAUSE_ACTIVE_FIELD: 1,
+                PAUSE_STATE_FIELD: STATE_CANCELLING,
+                PAUSE_OPERATION_FIELD: operation_id,
+                OPERATION_ATTEMPT_FIELD: 0,
+                PAUSE_LAST_RECONCILED_AT_FIELD: None,
+            },
+        )
+
+    try:
+        remote = initial_remote
+        remote_missing = False
+        remote_status = _remote_subscription_status(remote)
+        if not remote_missing and remote_status not in TERMINAL_STRIPE_STATUSES:
+            attempt = _next_operation_attempt(subscription_doc)
+            deleted_remote = stripe.Subscription.delete(
+                subscription_doc.stripe_subscription_id,
+                api_key=api_key,
+                idempotency_key=_operation_idempotency_key(
+                    subscription_doc,
+                    operation_id,
+                    attempt,
+                ),
+            )
+            deleted_status = _remote_subscription_status(deleted_remote)
+            deleted_id = str(_stripe_get(deleted_remote, "id") or "")
+            try:
+                remote = _retrieve_owned_subscription(subscription_doc, company_abbr, api_key)
+                remote_status = _remote_subscription_status(remote)
+            except Exception as exc:
+                if not _stripe_resource_is_missing(exc):
+                    raise
+                if (
+                    deleted_id != str(subscription_doc.stripe_subscription_id)
+                    or deleted_status not in TERMINAL_STRIPE_STATUSES
+                ):
+                    frappe.throw("Stripe did not confirm cancellation before the subscription disappeared")
+                remote_missing = True
+        if not remote_missing and remote_status not in TERMINAL_STRIPE_STATUSES:
+            frappe.throw("Stripe did not canonically confirm subscription cancellation")
+
+        completed_values = {
+            PAUSE_ACTIVE_FIELD: 0,
+            PAUSE_STATE_FIELD: "",
+            PAUSE_OPERATION_FIELD: "",
+            PENDING_RESUME_FIELD: None,
+            PENDING_RESUME_AT_FIELD: "",
+            RESUME_CANCEL_BEFORE_START_FIELD: 0,
+            OPERATION_ATTEMPT_FIELD: 0,
+            PAUSE_CYCLES_FIELD: 0,
+            CADENCE_SNAPSHOT_FIELD: "",
+            PAUSE_LAST_RECONCILED_AT_FIELD: None,
+            "stripe_paused": 0,
+            "status": "Cancelled",
+            "cancelation_date": nowdate(),
+        }
+        _set_subscription_fields(
+            subscription_doc.name,
+            completed_values,
+            required=COORDINATED_PAUSE_FIELDS,
+            update_modified=True,
+        )
+        _update_doc_values(subscription_doc, completed_values)
+        _finish_operation(event["id"], "Completed")
+    except Exception as exc:
+        frappe.db.rollback()
+        _finish_operation(event["id"], "Failed", str(exc))
+        raise
+
+    return _base_action_result(subscription_doc, "cancel", company_abbr)
+
+
+def _sync_subscription(subscription_doc, action: str, pause_cycles: int = 1):
     action = _normalize_action(action)
     if not action:
         return {"handled": False, "reason": "unsupported_action", "action": action}
 
     stripe_sub_id = getattr(subscription_doc, "stripe_subscription_id", None)
     if not stripe_sub_id:
-        return {"handled": False, "reason": "missing_stripe_subscription_id", "subscription": subscription_doc.name}
+        return {
+            "handled": False,
+            "reason": "missing_stripe_subscription_id",
+            "subscription": subscription_doc.name,
+        }
 
     company_abbr = _validate_company_for_stripe(subscription_doc.company)
     api_key = get_api_key(company_abbr)
-    ev = _event_stub(subscription_doc, action)
-    upsert_event(ev, payload=json.dumps(ev).encode(), company_abbr=company_abbr, status="Processing")
+    if action == "pause":
+        return _sync_pause_action(subscription_doc, pause_cycles, company_abbr, api_key)
+    if action == "resume":
+        return _sync_resume_action(subscription_doc, company_abbr, api_key)
+    if action == "cancel":
+        return _sync_cancel_action(subscription_doc, company_abbr, api_key)
 
+    if action == "plan_change" and int(subscription_doc.get(PAUSE_ACTIVE_FIELD) or 0):
+        return {
+            "handled": False,
+            "reason": "pause_active",
+            "subscription": subscription_doc.name,
+            "action": action,
+        }
+
+    # The only action reaching this legacy branch is plan_change. Establish
+    # canonical ownership before its event row is committed and before any
+    # Stripe mutation can be attempted.
+    _retrieve_owned_subscription(
+        subscription_doc,
+        company_abbr,
+        api_key,
+        expected_subscription_id=stripe_sub_id,
+    )
+
+    event = _event_stub(subscription_doc, action)
+    upsert_event(
+        event,
+        payload=json.dumps(event).encode(),
+        company_abbr=company_abbr,
+        status="Processing",
+    )
+    frappe.db.commit()
     try:
-        ok, reason = _validate_transition(stripe_sub_id, action, company_abbr)
-        if not ok:
-            mark_event_status(ev["id"], "Ignored", reason)
-            return {
-                "handled": False,
-                "reason": reason,
-                "subscription": subscription_doc.name,
-                "stripe_subscription_id": stripe_sub_id,
-                "action": action,
-            }
-
-        if action == "cancel":
-            stripe.Subscription.delete(stripe_sub_id, api_key=api_key)
-        elif action == "resume":
-            stripe.Subscription.modify(stripe_sub_id, pause_collection="", api_key=api_key)
-        elif action == "pause":
-            stripe.Subscription.modify(
-                stripe_sub_id,
-                pause_collection={"behavior": "void"},
-                api_key=api_key,
-            )
-        elif action == "plan_change":
+        if action == "plan_change":
             _sync_subscription_plan(subscription_doc, stripe_sub_id, company_abbr)
 
-        mark_event_status(ev["id"], "Completed")
-        return {
-            "handled": True,
-            "subscription": subscription_doc.name,
-            "stripe_subscription_id": stripe_sub_id,
-            "action": action,
-            "company_abbr": company_abbr,
-        }
-    except Exception as e:
-        mark_event_status(ev["id"], "Failed", str(e))
+        _finish_operation(event["id"], "Completed")
+        return _base_action_result(subscription_doc, action, company_abbr)
+    except Exception as exc:
+        _finish_operation(event["id"], "Failed", str(exc))
         raise
 
 
@@ -356,11 +1366,27 @@ def _resolve_sender(company_abbr: str):
     }
 
 
-def _set_subscription_fields(sub_name: str, values: dict):
+def _set_subscription_fields(
+    sub_name: str,
+    values: dict,
+    required=None,
+    *,
+    update_modified: bool = False,
+):
     meta = frappe.get_meta("Subscription")
+    missing = [fieldname for fieldname in (required or ()) if not meta.get_field(fieldname)]
+    if missing:
+        frappe.throw(
+            "Subscription pause migration is incomplete; missing fields: " + ", ".join(missing)
+        )
     update = {k: v for k, v in (values or {}).items() if meta.get_field(k)}
     if update:
-        frappe.db.set_value("Subscription", sub_name, update, update_modified=False)
+        frappe.db.set_value(
+            "Subscription",
+            sub_name,
+            update,
+            update_modified=update_modified,
+        )
         frappe.db.commit()
 
 
@@ -574,6 +1600,10 @@ def _build_stripe_subscription_create_params(sub_doc, stripe_customer_id: str, p
 def ensure_stripe_subscription_for_subscription(subscription_name: str, payment_method: str | None = None, stripe_customer_id: str | None = None):
     with MariaDBNamedLock(f"stripe-subscription-create-{subscription_name}", timeout=30):
         sub_doc = frappe.get_doc("Subscription", subscription_name)
+        if _is_non_billing_subscription(sub_doc):
+            frappe.throw(
+                f"Subscription {subscription_name} is non-billing and cannot be linked to Stripe"
+            )
         if sub_doc.get("stripe_subscription_id"):
             return {
                 "created": False,
@@ -963,37 +1993,159 @@ def _send_lifecycle_email(subscription_name: str, company_abbr: str, kind: str, 
     }
 
 
-def _apply_subscription_state(sub_name: str, stripe_sub_obj: dict):
+def _apply_subscription_state(sub_name: str, stripe_sub_obj: dict, subscription_doc=None):
     stripe_status = (stripe_sub_obj or {}).get("status")
-    paused = bool((stripe_sub_obj or {}).get("pause_collection"))
+    paused = _remote_pause_is_active(stripe_sub_obj)
     cancel_at_period_end = int(bool((stripe_sub_obj or {}).get("cancel_at_period_end")))
 
-    prev = frappe.db.get_value("Subscription", sub_name, ["stripe_status", "stripe_paused"], as_dict=True) or {}
+    meta = frappe.get_meta("Subscription")
+    tracked_fields = [
+        "status",
+        "cancelation_date",
+        "stripe_status",
+        "stripe_paused",
+        "cancel_at_period_end",
+        *COORDINATED_PAUSE_FIELDS,
+    ]
+    tracked_fields = list(dict.fromkeys(fieldname for fieldname in tracked_fields if meta.get_field(fieldname)))
+    prev = (
+        frappe.db.get_value(
+            "Subscription",
+            sub_name,
+            tracked_fields,
+            as_dict=True,
+        )
+        or {}
+    )
     prev_status = prev.get("stripe_status")
     prev_paused = bool(prev.get("stripe_paused"))
+    durable_cancelling = bool(
+        prev.get(PAUSE_STATE_FIELD) == STATE_CANCELLING
+        and prev.get(PAUSE_OPERATION_FIELD)
+    )
 
     update = {}
-    if frappe.get_meta("Subscription").get_field("stripe_status"):
+    if meta.get_field("stripe_status"):
         update["stripe_status"] = stripe_status or ""
-    if frappe.get_meta("Subscription").get_field("stripe_paused"):
+    if meta.get_field("stripe_paused"):
         update["stripe_paused"] = 1 if paused else 0
-    if frappe.get_meta("Subscription").get_field("cancel_at_period_end"):
+    if meta.get_field("cancel_at_period_end") and (
+        not durable_cancelling
+        or _remote_subscription_status(stripe_sub_obj) in TERMINAL_STRIPE_STATUSES
+    ):
         update["cancel_at_period_end"] = cancel_at_period_end
 
     erp_status = _map_stripe_to_erp_status(stripe_status, paused=paused)
     allowed = _erp_status_options()
-    if erp_status and (not allowed or erp_status in allowed):
+    applied_erp_status = erp_status if erp_status and (not allowed or erp_status in allowed) else None
+    if durable_cancelling and erp_status != "Cancelled":
+        applied_erp_status = None
+    if applied_erp_status:
         update["status"] = erp_status
+    if (
+        subscription_doc
+        and not paused
+        and int(subscription_doc.get(PAUSE_ACTIVE_FIELD) or 0)
+        and (subscription_doc.get(PAUSE_STATE_FIELD) or "") in {"", STATE_PAUSED}
+    ):
+        pause_start_at = int(subscription_doc.get(PAUSE_START_AT_FIELD) or 0)
+        planned_resume_at = int(subscription_doc.get(RESUME_AT_FIELD) or 0)
+        current_timestamp = _utc_now_timestamp()
+        if pause_start_at and current_timestamp < pause_start_at:
+            update.update(
+                {
+                    PAUSE_ACTIVE_FIELD: 0,
+                    PAUSE_STATE_FIELD: "",
+                    PAUSE_OPERATION_FIELD: "",
+                    PENDING_RESUME_FIELD: None,
+                    PENDING_RESUME_AT_FIELD: "",
+                    RESUME_CANCEL_BEFORE_START_FIELD: 0,
+                    OPERATION_ATTEMPT_FIELD: 0,
+                    PAUSE_CYCLES_FIELD: 0,
+                    CADENCE_SNAPSHOT_FIELD: "",
+                    PAUSE_LAST_RECONCILED_AT_FIELD: None,
+                }
+            )
+        elif pause_start_at and planned_resume_at and current_timestamp < planned_resume_at:
+            resume_target = build_resume_target(
+                subscription_doc,
+                current_timestamp=current_timestamp,
+            )
+            if not resume_target["cancel_before_start"] and int(
+                resume_target["billing_cycles"] or 0
+            ):
+                update.update(
+                    {
+                        PAUSE_ACTIVE_FIELD: 1,
+                        PAUSE_STATE_FIELD: STATE_PAUSED,
+                        PAUSE_OPERATION_FIELD: "",
+                        PENDING_RESUME_FIELD: None,
+                        PENDING_RESUME_AT_FIELD: "",
+                        RESUME_CANCEL_BEFORE_START_FIELD: 0,
+                        OPERATION_ATTEMPT_FIELD: 0,
+                        RESUME_ON_FIELD: resume_target["resume_on"],
+                        RESUME_AT_FIELD: str(resume_target["resume_at"]),
+                        PAUSE_CYCLES_FIELD: int(resume_target["billing_cycles"]),
+                    }
+                )
+    if erp_status == "Cancelled":
+        for fieldname, value in {
+            "cancelation_date": prev.get("cancelation_date") or nowdate(),
+            PAUSE_ACTIVE_FIELD: 0,
+            PAUSE_STATE_FIELD: "",
+            PAUSE_OPERATION_FIELD: "",
+            PENDING_RESUME_FIELD: None,
+            PENDING_RESUME_AT_FIELD: "",
+            RESUME_CANCEL_BEFORE_START_FIELD: 0,
+            OPERATION_ATTEMPT_FIELD: 0,
+            PAUSE_CYCLES_FIELD: 0,
+            CADENCE_SNAPSHOT_FIELD: "",
+            PAUSE_LAST_RECONCILED_AT_FIELD: None,
+        }.items():
+            if meta.get_field(fieldname):
+                update[fieldname] = value
 
-    if update:
-        frappe.db.set_value("Subscription", sub_name, update, update_modified=False)
+    numeric_fields = {
+        "stripe_paused",
+        "cancel_at_period_end",
+        PAUSE_ACTIVE_FIELD,
+        RESUME_CANCEL_BEFORE_START_FIELD,
+        OPERATION_ATTEMPT_FIELD,
+        PAUSE_CYCLES_FIELD,
+    }
+
+    def values_match(fieldname, current, desired):
+        if fieldname in numeric_fields:
+            return int(current or 0) == int(desired or 0)
+        if current in (None, "") and desired in (None, ""):
+            return True
+        return current == desired or str(current) == str(desired)
+
+    changes = {
+        fieldname: value
+        for fieldname, value in update.items()
+        if not values_match(fieldname, prev.get(fieldname), value)
+    }
+    modified_fields = {
+        "status",
+        "cancelation_date",
+        "stripe_status",
+        "cancel_at_period_end",
+    }
+    if changes:
+        frappe.db.set_value(
+            "Subscription",
+            sub_name,
+            changes,
+            update_modified=bool(modified_fields.intersection(changes)),
+        )
         frappe.db.commit()
 
     return {
         "subscription": sub_name,
         "stripe_status": stripe_status,
         "paused": paused,
-        "erp_status": update.get("status"),
+        "erp_status": applied_erp_status,
         "prev_stripe_status": prev_status,
         "prev_paused": prev_paused,
     }
@@ -1006,28 +2158,50 @@ def sync_subscription_from_webhook_event(event: dict):
         return {"handled": False, "reason": "missing_stripe_subscription_id"}
 
     sub_name = frappe.db.get_value("Subscription", {"stripe_subscription_id": stripe_sub_id}, "name")
+    link_from_metadata = False
     if not sub_name:
         metadata = stripe_sub.get("metadata") or {}
         candidate = metadata.get("docname") if metadata.get("doctype") == "Subscription" else None
         if candidate and frappe.db.exists("Subscription", candidate):
             sub_name = candidate
-            items = _stripe_get(_stripe_get(stripe_sub, "items") or {}, "data") or []
-            _set_subscription_fields(
-                sub_name,
-                {
-                    "stripe_customer_id": stripe_sub.get("customer") or "",
-                    "stripe_subscription_id": stripe_sub_id,
-                    "stripe_subscription_item_id": _stripe_get(items[0], "id") if items else "",
-                },
-            )
+            link_from_metadata = True
     if not sub_name:
         return {"handled": False, "reason": "subscription_not_found", "stripe_subscription_id": stripe_sub_id}
 
-    out = _apply_subscription_state(sub_name, stripe_sub)
-    out["handled"] = True
+    with MariaDBNamedLock(f"stripe-subscription-action-{sub_name}", timeout=30):
+        subscription = frappe.get_doc("Subscription", sub_name)
+        company_abbr = _validate_company_for_stripe(subscription.company)
+        existing_subscription_id = str(subscription.get("stripe_subscription_id") or "").strip()
+        if existing_subscription_id and existing_subscription_id != stripe_sub_id:
+            frappe.throw("ERPNext Subscription is already linked to a different Stripe subscription")
+        remote = _retrieve_owned_subscription(
+            subscription,
+            company_abbr,
+            get_api_key(company_abbr),
+            expected_subscription_id=stripe_sub_id,
+        )
+        if link_from_metadata:
+            items = _stripe_get(_stripe_get(remote, "items") or {}, "data") or []
+            linked_values = {
+                "stripe_customer_id": _stripe_get(remote, "customer") or "",
+                "stripe_subscription_id": stripe_sub_id,
+                "stripe_subscription_item_id": _stripe_get(items[0], "id") if items else "",
+            }
+            _set_subscription_fields(sub_name, linked_values)
+            _update_doc_values(subscription, linked_values)
+        canonical_stripe_sub = (
+            remote.to_dict_recursive()
+            if hasattr(remote, "to_dict_recursive")
+            else dict(remote)
+        )
+        _validate_cadence_for_status_sync(subscription, remote)
+        out = _apply_subscription_state(
+            sub_name,
+            canonical_stripe_sub,
+            subscription,
+        )
+        out["handled"] = True
 
-    company = frappe.db.get_value("Subscription", sub_name, "company")
-    company_abbr = get_company_abbr_from_company(company)
     kind = _pick_lifecycle_kind(
         out.get("prev_stripe_status"),
         bool(out.get("prev_paused")),
@@ -1053,21 +2227,30 @@ def reconcile_subscription_status(subscription_name: str):
     if not stripe_sub_id:
         return {"handled": False, "reason": "missing_stripe_subscription_id", "subscription": subscription_name}
 
-    company_abbr = _validate_company_for_stripe(sub.company)
-    remote = stripe.Subscription.retrieve(
-        stripe_sub_id,
-        api_key=get_api_key(company_abbr),
-    )
-    return _apply_subscription_state(sub.name, dict(remote))
+    with MariaDBNamedLock(f"stripe-subscription-action-{subscription_name}", timeout=30):
+        sub = frappe.get_doc("Subscription", subscription_name)
+        stripe_sub_id = getattr(sub, "stripe_subscription_id", None)
+        if not stripe_sub_id:
+            return {
+                "handled": False,
+                "reason": "missing_stripe_subscription_id",
+                "subscription": subscription_name,
+            }
+        company_abbr = _validate_company_for_stripe(sub.company)
+        remote = _retrieve_owned_subscription(sub, company_abbr, get_api_key(company_abbr))
+        _validate_cadence_for_status_sync(sub, remote)
+        return _apply_subscription_state(sub.name, dict(remote), sub)
 
 
 @frappe.whitelist()
-def sync_subscription_action(subscription_name: str, action: str):
+def sync_subscription_action(subscription_name: str, action: str, pause_cycles: int = 1):
     _require_subscription_action_role()
-    sub = _require_subscription_permission(subscription_name, "write")
+    _require_subscription_permission(subscription_name, "write")
     if not _is_enabled():
         return {"handled": False, "reason": "subscription_sync_disabled"}
-    return _sync_subscription(sub, action)
+    with MariaDBNamedLock(f"stripe-subscription-action-{subscription_name}", timeout=30):
+        sub = frappe.get_doc("Subscription", subscription_name)
+        return _sync_subscription(sub, action, pause_cycles=pause_cycles)
 
 
 @frappe.whitelist()
@@ -1132,17 +2315,44 @@ def request_subscription_payment_method(subscription_name: str, send_email: int 
     return out
 
 
-def queue_subscription_action(subscription_name: str, action: str):
+def _sync_cancelled_subscription_after_commit(subscription_name: str):
+    with MariaDBNamedLock(f"stripe-subscription-action-{subscription_name}", timeout=30):
+        subscription = frappe.get_doc("Subscription", subscription_name)
+        status_is_cancelled = (subscription.get("status") or "").strip().lower() in {
+            "cancelled",
+            "canceled",
+        }
+        durable_cancelling = bool(
+            subscription.get(PAUSE_STATE_FIELD) == STATE_CANCELLING
+            and subscription.get(PAUSE_OPERATION_FIELD)
+        )
+        if not status_is_cancelled and not durable_cancelling:
+            return {
+                "handled": False,
+                "reason": "subscription_not_cancelled",
+                "subscription": subscription_name,
+            }
+        return _sync_subscription(subscription, "cancel")
+
+
+def queue_subscription_action(subscription_name: str, action: str, *, trusted_cancel: bool = False):
     action = _normalize_action(action)
     if not action:
         return None
+    method = "stripe_integration.stripe_integration.subscription_sync.sync_subscription_action"
+    kwargs = {"subscription_name": subscription_name, "action": action}
+    if trusted_cancel and action == "cancel":
+        method = (
+            "stripe_integration.stripe_integration.subscription_sync."
+            "_sync_cancelled_subscription_after_commit"
+        )
+        kwargs = {"subscription_name": subscription_name}
     return frappe.enqueue(
-        "stripe_integration.stripe_integration.subscription_sync.sync_subscription_action",
+        method,
         queue="short",
         timeout=300,
-        subscription_name=subscription_name,
-        action=action,
         enqueue_after_commit=True,
+        **kwargs,
     )
 
 
@@ -1186,14 +2396,19 @@ def retry_failed_subscription_events(limit: int = 20):
             continue
 
         try:
-            subscription = frappe.get_doc("Subscription", sub_name)
-            company_abbr = _validate_company_for_stripe(subscription.company)
-            remote = stripe.Subscription.retrieve(
-                r.get("stripe_object_id"),
-                api_key=get_api_key(company_abbr),
-            )
-            result = _apply_subscription_state(sub_name, dict(remote))
-            mark_event_status(r.get("event_id"), "Completed")
+            with MariaDBNamedLock(f"stripe-subscription-action-{sub_name}", timeout=30):
+                subscription = frappe.get_doc("Subscription", sub_name)
+                company_abbr = _validate_company_for_stripe(subscription.company)
+                remote = _retrieve_owned_subscription(
+                    subscription,
+                    company_abbr,
+                    get_api_key(company_abbr),
+                    expected_subscription_id=r.get("stripe_object_id"),
+                )
+                _validate_cadence_for_status_sync(subscription, remote)
+                result = _apply_subscription_state(sub_name, dict(remote), subscription)
+                mark_event_status(r.get("event_id"), "Completed")
+                frappe.db.commit()
             out.append({"event_id": r.get("event_id"), "subscription": sub_name, "result": result})
         except Exception as e:
             out.append({"event_id": r.get("event_id"), "subscription": sub_name, "error": str(e)[:300]})
@@ -1235,6 +2450,9 @@ def get_subscription_sync_health(hours: int = 24):
     }
 
 def _enforce_subscription_billing_defaults(doc):
+    if _is_non_billing_subscription(doc):
+        return
+
     # Keep ERP subscription invoicing fully automatic.
     # We use db_set so this still works on submitted subscriptions where normal field updates are blocked.
     try:
@@ -1250,8 +2468,47 @@ def _enforce_subscription_billing_defaults(doc):
         pass
 
 
+def _persist_native_cancellation_intent(subscription_doc) -> str:
+    _require_coordinated_pause_fields()
+    company_abbr = _validate_company_for_stripe(subscription_doc.company)
+    operation_id = subscription_doc.get(PAUSE_OPERATION_FIELD)
+    existing_intent = bool(
+        subscription_doc.get(PAUSE_STATE_FIELD) == STATE_CANCELLING
+        and operation_id
+    )
+    if not existing_intent:
+        operation_id = _new_operation_id("cancel")
+
+    event = _event_stub(subscription_doc, "cancel", operation_id=operation_id)
+    upsert_event(
+        event,
+        payload=json.dumps(event).encode(),
+        company_abbr=company_abbr,
+        status="Queued",
+    )
+    values = {
+        PAUSE_ACTIVE_FIELD: 1,
+        PAUSE_STATE_FIELD: STATE_CANCELLING,
+        PAUSE_OPERATION_FIELD: operation_id,
+        PAUSE_LAST_RECONCILED_AT_FIELD: None,
+    }
+    if not existing_intent:
+        values[OPERATION_ATTEMPT_FIELD] = 0
+    frappe.db.set_value(
+        "Subscription",
+        subscription_doc.name,
+        values,
+        update_modified=False,
+    )
+    _update_doc_values(subscription_doc, values)
+    return operation_id
+
+
 def on_subscription_update(doc, method=None):
     _enforce_subscription_billing_defaults(doc)
+
+    if _is_non_billing_subscription(doc):
+        return
 
     if not _is_enabled():
         return
@@ -1261,16 +2518,16 @@ def on_subscription_update(doc, method=None):
 
     status = (doc.status or "").lower().strip()
     if status in ("cancelled", "canceled"):
-        queue_subscription_action(doc.name, "cancel")
+        _persist_native_cancellation_intent(doc)
+        queue_subscription_action(doc.name, "cancel", trusted_cancel=True)
         return
 
-    action = _normalize_action(getattr(doc, "stripe_sync_action", None))
-    if action in ("pause", "resume", "plan_change"):
-        queue_subscription_action(doc.name, action)
-        try:
-            frappe.db.set_value("Subscription", doc.name, "stripe_sync_action", "", update_modified=False)
-        except Exception:
-            pass
+    legacy_action = str(getattr(doc, "stripe_sync_action", None) or "").strip()
+    if legacy_action:
+        _require_subscription_action_role()
+        frappe.throw(
+            "Legacy stripe_sync_action saves are not supported; use the Stripe action controls"
+        )
 
 
 @frappe.whitelist(allow_guest=True)

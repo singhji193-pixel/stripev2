@@ -11,6 +11,10 @@ doctype_js = {
     "Subscription": "public/js/subscription_stripe.js",
 }
 
+override_doctype_class = {
+    "Subscription": "stripe_integration.stripe_integration.subscription_override.StripeManagedSubscription",
+}
+
 
 doc_events = {}
 
